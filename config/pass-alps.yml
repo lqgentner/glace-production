@@ -1,0 +1,66 @@
+# Per-orbit-pass composites of the Alpine glaciers (Paul et al. 2020 outlines, buffered
+# by `glacier_buffer_m`), mean aggregation. They are not part of GLACE: the validation
+# compares them with the LRW composites, and the LRW-effect figure draws them.
+# `year` is not set here: pass it as an override, e.g.
+# `process-composites.py config/pass-alps.yml year=2023`.
+scope: alps
+# The Alps-wide window, shared with the LRW runs.
+window: alps-total
+method: pass
+polarizations: [VV, VH]
+mode: IW
+baseline_days: 12
+pixel_size_m: 10
+glacier_buffer_m: 250
+simplify_m: 20
+aggregation: mean
+write_qa: false
+
+compression:
+  products:
+    compress: zstd
+    zstd_level: 1
+    predictor: 3
+
+  composites:
+    default:              {compress: lerc_zstd, max_z_error: 1.0e-5}
+    COH_COMP_A:           {max_z_error: 1.0e-4}
+    COH_COMP_D:           {max_z_error: 1.0e-4}
+    RTC_COMP_A_QA-NUM:    {max_z_error: 0}
+    RTC_COMP_D_QA-NUM:    {max_z_error: 0}
+    COH_COMP_A_QA-NUM:    {max_z_error: 0}
+    COH_COMP_D_QA-NUM:    {max_z_error: 0}
+
+dem:
+  source: dem/glo30-alps_ellipsoid.tif
+  name: Copernicus GLO-30, WGS 84 ellipsoidal heights
+  nodata: -32768.0
+  apply_egm: false
+
+
+dirs:
+  # SLC and burst products are shared with the LRW run; the composites are not.
+  base_dir: alps-total/{year}
+  comp_dir: alps-total/{year}/s1-comp-pass
+
+backscatter:
+  multilook: [5, 1]
+  dem_oversampling: 1.0
+  additional_overlap: 0.2
+  replace_zeros_with_nan: true
+  grid_spacing: 10.0
+  img_resampling: BILINEAR_INTERPOLATION
+  dem_resampling: BILINEAR_INTERPOLATION
+  align_to_standard_grid: true
+
+coherence:
+  window: [35, 7]
+  subtract_flat_earth_phase: true
+  subtract_topographic_phase: true
+  replace_zeros_with_nan: true
+  grid_spacing: 10.0
+  img_resampling: BILINEAR_INTERPOLATION
+  dem_resampling: BILINEAR_INTERPOLATION
+  align_to_standard_grid: true
+  correct_coherence_bias: false
+  remove_local_phase_ramp: false

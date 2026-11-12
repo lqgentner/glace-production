@@ -1,0 +1,267 @@
+---
+# Runs one script on a single VM that tears itself down when the command
+# completes. Secrets (.env, the AWS credentials file, the EE service account key
+# and the ghcr.io token) are pushed over SSH after boot, exactly as fleet.yml
+# does — never through cloud-init userdata, which OpenStack keeps in the
+# instance metadata service where anything on the VM, and anyone with API
+# access to the project, can read it back.
+#
+# The job itself is started as a detached systemd unit so it survives the SSH
+# session; it uploads the logs and powers the VM off, and the final play here
+# polls for that shutdown and deletes the VM.
+#
+# Usage:
+#   pixi run -e deploy ansible-playbook deploy/run.yml -e "cmd='scripts/s1-composites/process-composites.py config/lrw-alps.yml year=2022'"
+#
+# Options (extra vars):
+#   wait=false    start the job and return; delete the VM yourself once it is SHUTOFF
+#   max_hours=N   how long to poll for the job before giving up (default 12)
+
+- name: Create the VM
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    vm_name: "glacier-run-{{ cmd.split(' ')[0].split('/')[-1] | regex_replace('\\.py$', '') }}"
+
+  tasks:
+    - name: Fail if cmd is not provided
+      ansible.builtin.fail:
+        msg: "cmd is required: -e \"cmd='scripts/my-script.py --arg value'\""
+      when: cmd is not defined
+
+    # Held as a fact under its own name so the later plays can reach it via
+    # hostvars without colliding with an -e "vm_name=..." override.
+    - name: Record the VM name
+      ansible.builtin.set_fact:
+        job_vm_name: "{{ vm_name }}"
+
+    - name: Parse local .env into vars
+      ansible.builtin.set_fact:
+        local_env: >-
+          {{ lookup('file', playbook_dir + '/../.env').splitlines()
+            | select('match', '^[A-Z]')
+            | map('split', '=', 1)
+            | list
+            | items2dict(key_name=0, value_name=1) }}
+      no_log: true
+
+    - name: Render .env content
+      ansible.builtin.set_fact:
+        env_content: "{{ lookup('template', playbook_dir + '/env.j2') }}"
+        ee_key_file: "{{ local_env['EE_SERVICE_ACC_KEY_FILE'] }}"
+      no_log: true
+
+    - name: Render AWS credentials
+      ansible.builtin.set_fact:
+        aws_credentials_content: "{{ lookup('template', playbook_dir + '/aws-credentials.j2') }}"
+      no_log: true
+
+    - name: Create VM
+      openstack.cloud.server:
+        cloud: "{{ cloud }}"
+        name: "{{ job_vm_name }}"
+        image: "{{ openstack_image }}"
+        flavor: "{{ openstack_flavor }}"
+        network: "{{ openstack_network }}"
+        key_name: "{{ openstack_keypair }}"
+        security_groups: "{{ openstack_security_groups }}"
+        auto_ip: false
+        wait: true
+        state: present
+      register: vm
+
+    - name: Retrieve SSH host key via ssh-keyscan
+      ansible.builtin.shell: |
+        for i in $(seq 55); do
+          out=$(ssh-keyscan -t ed25519 -T 5 {{ vm.server.addresses[openstack_network][0].addr }} 2>/dev/null)
+          if [ -n "$out" ]; then
+            echo "$out"
+            exit 0
+          fi
+          sleep 10
+        done
+        exit 1
+      register: keyscan
+      changed_when: false
+
+    - name: Add VM host key to known_hosts
+      ansible.builtin.known_hosts:
+        name: "{{ vm.server.addresses[openstack_network][0].addr }}"
+        key: "{{ keyscan.stdout_lines | reject('match', '^#') | first }}"
+        state: present
+
+    - name: Register VM in inventory
+      ansible.builtin.add_host:
+        name: "{{ vm.server.addresses[openstack_network][0].addr }}"
+        groups: glacier_run_vm
+        ansible_user: ubuntu
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: '-o GSSAPIAuthentication=no'
+
+
+- name: Bootstrap the VM and start the job
+  hosts: glacier_run_vm
+  gather_facts: false
+  become: true
+  vars:
+    github_token: "{{ lookup('env', 'GITHUB_TOKEN') | default(lookup('pipe', 'gh auth token'), true) }}"
+    github_actor: "{{ lookup('env', 'GITHUB_ACTOR') | default(lookup('pipe', 'gh api user --jq .login'), true) }}"
+    job_vm_name: "{{ hostvars['localhost']['job_vm_name'] }}"
+
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Prepare the host (upgrade, reboot, Docker)
+      ansible.builtin.include_tasks: tasks/prepare-host.yml
+
+    - name: Create logs directory
+      ansible.builtin.file:
+        path: /home/ubuntu/logs
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Write .env file
+      ansible.builtin.copy:
+        content: "{{ hostvars['localhost']['env_content'] }}"
+        dest: /home/ubuntu/.env
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+
+    - name: Create secrets directory
+      ansible.builtin.file:
+        path: /home/ubuntu/secrets
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0700'
+
+    - name: Copy EE service account key
+      ansible.builtin.copy:
+        src: "{{ hostvars['localhost']['ee_key_file'] }}"
+        dest: /home/ubuntu/secrets/ee-service-account.json
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+
+    - name: Write AWS credentials file
+      ansible.builtin.copy:
+        content: "{{ hostvars['localhost']['aws_credentials_content'] }}"
+        dest: /home/ubuntu/secrets/aws-credentials
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+      no_log: true
+
+    - name: Write log upload script
+      ansible.builtin.copy:
+        dest: /home/ubuntu/upload_logs.py
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          # Goes through the project settings rather than raw env keys, so the
+          # upload inherits the configured profile and the checksum settings the
+          # Ceph gateway needs.
+          import glob, os, shutil
+          from pathlib import Path
+          from glace_production.config import settings
+          bucket = os.environ['GLACIERS_DATA_DIR'].split('/')[2]
+          log_dir = settings.resolve_path(f's3://{bucket}/logs')
+          for f in glob.glob('/app/logs/*.log'):
+              dest = log_dir / Path(f).name
+              with Path(f).open('rb') as src, dest.open('wb') as dst:
+                  shutil.copyfileobj(src, dst)
+              print(f'Uploaded {f} -> {dest}')
+
+    - name: Log in to ghcr.io
+      community.docker.docker_login:
+        registry: ghcr.io
+        username: "{{ github_actor }}"
+        password: "{{ github_token }}"
+
+    - name: Pull Docker image
+      community.docker.docker_image:
+        name: "{{ hostvars['localhost']['image'] }}"
+        source: pull
+        force_source: true
+      async: 600
+      poll: 15
+
+    - name: Write job runner script
+      ansible.builtin.copy:
+        dest: /home/ubuntu/run-job.sh
+        owner: root
+        group: root
+        mode: '0755'
+        content: |
+          #!/usr/bin/env bash
+          # Deliberately no `set -e`: the logs must still be uploaded and the VM
+          # still shut down when the job itself fails, otherwise the controlling
+          # playbook polls for a shutdown that never comes.
+          set -uo pipefail
+
+          docker run --name {{ job_vm_name }} \
+            --env-file /home/ubuntu/.env \
+            -v /home/ubuntu/logs:/app/logs \
+            -v /home/ubuntu/secrets/ee-service-account.json:/app/secrets/ee-service-account.json \
+            -v /home/ubuntu/secrets/aws-credentials:/app/secrets/aws-credentials:ro \
+            {{ hostvars['localhost']['image'] }} python {{ cmd }}
+          echo "job container exited with status $?"
+
+          docker run --rm \
+            --env-file /home/ubuntu/.env \
+            -v /home/ubuntu/logs:/app/logs \
+            -v /home/ubuntu/secrets/aws-credentials:/app/secrets/aws-credentials:ro \
+            -v /home/ubuntu/upload_logs.py:/upload_logs.py \
+            {{ hostvars['localhost']['image'] }} python /upload_logs.py
+          echo "log upload exited with status $?"
+
+          poweroff
+
+    - name: Start the job
+      ansible.builtin.command:
+        cmd: >-
+          systemd-run --unit=glacier-run --collect --no-block
+          /home/ubuntu/run-job.sh
+      changed_when: true
+
+
+- name: Wait for the job to finish and delete the VM
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+  tasks:
+    - name: Print monitoring commands
+      ansible.builtin.debug:
+        msg:
+          - "VM {{ job_vm_name }} ({{ vm.server.addresses[openstack_network][0].addr }})"
+          - "SSH: ssh ubuntu@{{ vm.server.addresses[openstack_network][0].addr }}"
+          - "Job logs: ssh ubuntu@{{ vm.server.addresses[openstack_network][0].addr }} 'sudo docker logs -f {{ job_vm_name }}'"
+          - "Runner unit: ssh ubuntu@{{ vm.server.addresses[openstack_network][0].addr }} 'sudo journalctl -u glacier-run -f'"
+          - "{{ 'Polling for completion every 60s (max ' ~ (max_hours | default(12)) ~ 'h) — VM will be deleted automatically.' if (wait | default(true) | bool) else 'Not waiting: once the VM is SHUTOFF, delete it with  pixi run -e deploy openstack server delete ' ~ job_vm_name }}"
+
+    - name: Wait for VM to shut down
+      openstack.cloud.server_info:
+        cloud: "{{ cloud }}"
+        name: "{{ job_vm_name }}"
+      register: vm_info
+      until: vm_info.servers | length > 0 and vm_info.servers[0].status == 'SHUTOFF'
+      retries: "{{ (max_hours | default(12) | int) * 60 }}"
+      delay: 60
+      when: wait | default(true) | bool
+
+    - name: Delete VM
+      openstack.cloud.server:
+        cloud: "{{ cloud }}"
+        name: "{{ job_vm_name }}"
+        state: absent
+        wait: true
+      when: wait | default(true) | bool

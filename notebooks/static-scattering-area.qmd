@@ -1,0 +1,199 @@
+---
+title: "Static scattering area"
+format:
+  html:
+    embed-resources: true
+jupyter: python3
+---
+
+How far the local scattering area $A$ changes between acquisitions of one relative
+orbit, i.e. what a static $A$ (one per relative orbit, as for OPERA RTC-S1) would get
+wrong, from one mountainous burst footprint over all acquisitions of the compositing
+windows 2015–2025 (2026 is not fully processed). Terrain flattening divides by $A$ and
+local resolution weighting weights by $1/A$, so the error of a static $A$ is the same in
+both, in dB: $\varepsilon_t = 10 \log_{10}(A_t / A_\text{static})$. $A_\text{static}$
+is the per-pixel temporal median, the best any static value can do, and each pixel is
+summarised by its worst acquisition. 1 dB is Sentinel-1's specified absolute radiometric
+accuracy (3σ; Schmidt et al., 2018, 2020). Where the LRW weight cap
+(`clip_max_resolution`) sits in the distribution of $1/A$ is in `lrw-weight-cap.qmd`.
+
+Radar shadow is NaN in the products and is left out of each pixel's statistics; a
+last section counts the pixels that change between shadow and observed. The analysed
+area is inside the footprint of every acquisition.
+
+```{python}
+from concurrent.futures import ThreadPoolExecutor
+import warnings
+
+import numpy as np
+from rasterio.windows import Window
+from scipy import ndimage
+import yaml
+
+from freezebase.raster import rasterio_open
+
+from glace_production.config import settings
+from data_paths import LRW_CONFIG, run_dirs
+```
+
+## Configuration
+
+Burst 30346 of IW1 on relative orbit 15 covers the Bernese Alps, Valais and Ticino, the
+footprint of an earlier analysis of the static terrain flattening.
+
+```{python}
+BURST = "015A_030346_IW1"  # relative orbit and pass, burst ID, sub-swath
+POLARIZATION = "VV"  # VV and VH products carry the same scattering area
+YEARS = range(2015, 2025 + 1)
+AREA_BAND = 2  # band 1 is gamma0, band 2 the scattering area
+THRESHOLD_DB = 1.0
+BLOCK_ROWS = 256  # rows read at once, from every acquisition
+N_WORKERS = 8
+
+WEIGHT_CAP = yaml.safe_load(LRW_CONFIG.read_text())["clip_max_resolution"]
+CAP_DB = 10 * np.log10(WEIGHT_CAP)  # A is capped below -CAP_DB
+
+files = sorted(
+    (
+        f
+        for year in YEARS
+        for f in run_dirs(year).prod_dir.glob(f"S1_RTC_{BURST}_{POLARIZATION}_*.tif")
+    ),
+    key=lambda f: f.name,
+)
+print(f"{len(files)} acquisitions")
+```
+
+## Statistics
+
+The acquisitions share one 10 m grid; each is placed on the union of their extents.
+
+```{python}
+bounds = []
+for f in files:
+    with rasterio_open(f) as src:
+        bounds.append((src.bounds, src.res[0], src.height, src.width))
+res = bounds[0][1]
+left = min(b.left for b, *_ in bounds)
+top = max(b.top for b, *_ in bounds)
+width = round((max(b.right for b, *_ in bounds) - left) / res)
+height = round((top - min(b.bottom for b, *_ in bounds)) / res)
+offsets = [(round((top - b.top) / res), round((b.left - left) / res)) for b, *_ in bounds]
+
+
+def read_rows(i: int, start: int, stop: int) -> np.ndarray:
+    """Scattering area of acquisition ``i`` in rows ``start:stop`` of the union grid."""
+    out = np.full((stop - start, width), np.nan, dtype="float32")
+    (r, c), (_, _, h, w) = offsets[i], bounds[i]
+    lo, hi = max(start - r, 0), min(stop - r, h)
+    if lo < hi:
+        with rasterio_open(files[i]) as src:
+            out[lo + r - start : hi + r - start, c : c + w] = src.read(
+                AREA_BAND, window=Window(0, lo, w, hi - lo)
+            )
+    return out
+
+
+def footprint(i: int) -> np.ndarray:
+    """Pixels inside the footprint of acquisition ``i``, shadow holes filled."""
+    return ndimage.binary_fill_holes(np.isfinite(read_rows(i, 0, height)))
+
+
+area = np.ones((height, width), dtype=bool)
+with ThreadPoolExecutor(N_WORKERS) as ex:
+    for fp in ex.map(footprint, range(len(files))):
+        area &= fp
+print(f"analysed area {area.sum() * res**2 / 1e6:.0f} km²")
+```
+
+Per pixel: the worst deviation from the temporal median, the temporal standard
+deviation of $\varepsilon_t$, the smallest valid $A$, the number of valid acquisitions
+and how often the pixel changes between valid and shadow from one acquisition to the
+next (in date order).
+
+```{python}
+worst_db = np.full((height, width), np.nan, dtype="float32")
+std_db = np.full((height, width), np.nan, dtype="float32")
+min_db = np.full((height, width), np.nan, dtype="float32")
+n_valid = np.zeros((height, width), dtype="uint16")
+n_switch = np.zeros((height, width), dtype="uint16")
+
+with ThreadPoolExecutor(N_WORKERS) as ex, warnings.catch_warnings():
+    warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN pixels outside the area
+    for start in range(0, height, BLOCK_ROWS):
+        stop = min(start + BLOCK_ROWS, height)
+        stack = np.stack(list(ex.map(lambda i: read_rows(i, start, stop), range(len(files)))))
+        stack[:, ~area[start:stop]] = np.nan
+        db = 10 * np.log10(np.where(stack > 0, stack, np.nan))
+        del stack
+        eps = db - np.nanmedian(db, axis=0)
+        worst_db[start:stop] = np.nanmax(np.abs(eps), axis=0)
+        std_db[start:stop] = np.nanstd(eps, axis=0)
+        min_db[start:stop] = np.nanmin(db, axis=0)
+        valid = np.isfinite(db)
+        n_valid[start:stop] = valid.sum(0)
+        n_switch[start:stop] = (valid[1:] != valid[:-1]).sum(0)  # files are in date order
+        del db, eps, valid
+```
+
+## Results
+
+Pixels need two valid acquisitions for a deviation.
+
+```{python}
+pixels = area & (n_valid >= 2)
+worst = worst_db[pixels]
+print(
+    f"{np.mean(worst > THRESHOLD_DB):.1%} of the pixels deviate by more than "
+    f"{THRESHOLD_DB:g} dB from their temporal median A in at least one of "
+    f"{len(files)} acquisitions (median pixel {np.median(worst):.2f} dB)."
+)
+```
+
+For comparison with Agram et al. (2023), who report the temporal standard deviation of
+the flattening factor of a Sentinel-1 burst stack processed with SNAP:
+
+```{python}
+print(f"temporal std below 0.1 dB: {np.mean(std_db[pixels] < 0.1):.1%} of the pixels")
+```
+
+## Shadow
+
+The deviations above leave out the acquisitions in which a pixel has no valid $A$,
+radar shadow. How many pixels of the analysed area are in shadow in some acquisitions
+and observed in others, and how often they change. Pixels that are never shadowed
+change zero times; the smallest valid $A$ of a switching pixel tells whether it borders
+shadow on the high-resolution side ($A$ below the weight cap) or not.
+
+```{python}
+nv, ns = n_valid[area], n_switch[area]
+switching = (nv > 0) & (nv < len(files))
+print(f"never shadowed: {np.mean(nv == len(files)):.2%} of the area")
+print(f"always shadowed: {np.mean(nv == 0):.2%}")
+print(f"shadowed in some acquisitions, observed in others: {np.mean(switching):.2%}")
+print(
+    f"changes between shadow and observed per switching pixel: median "
+    f"{np.median(ns[switching]):.0f}, 90th percentile {np.quantile(ns[switching], 0.9):.0f} "
+    f"(of {len(files) - 1} possible)"
+)
+shadowed = len(files) - nv[switching]
+print(
+    f"acquisitions in shadow per switching pixel: median {np.median(shadowed):.0f}, "
+    f"10th-90th percentile {np.quantile(shadowed, 0.1):.0f}-{np.quantile(shadowed, 0.9):.0f}"
+)
+near = min_db[area][switching] < -CAP_DB
+print(f"switching pixels with smallest valid A < {1 / WEIGHT_CAP:g}: {np.mean(near):.1%}")
+```
+
+## References
+
+- Agram, P. S., Warren, M. S., Arko, S. A., & Calef, M. T. (2023). Radiometric terrain
+  flattening of geocoded stacks of SAR imagery. *Remote Sensing*, 15(7), 1932.
+  https://doi.org/10.3390/rs15071932
+- Schmidt, K., Tous Ramon, N., & Schwerdt, M. (2018). Radiometric accuracy and
+  stability of Sentinel-1A determined using point targets. *International Journal of
+  Microwave and Wireless Technologies*, 10(5–6), 538–546.
+  https://doi.org/10.1017/s1759078718000016
+- Schmidt, K., Schwerdt, M., Miranda, N., & Reimann, J. (2020). Radiometric comparison
+  within the Sentinel-1 SAR constellation over a wide backscatter range. *Remote
+  Sensing*, 12(5), 854. https://doi.org/10.3390/rs12050854

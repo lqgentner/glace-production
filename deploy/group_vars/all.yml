@@ -1,0 +1,34 @@
+image: ghcr.io/lqgentner/glace-production:latest
+
+# OpenStack: these are the values of the University of Zurich's ScienceCloud,
+# where GLACE Alps was produced. Fill in your own after running
+# `openstack image/flavor/network list`. The playbooks only start one VM per job
+# that runs the container above; any host that can run it works, and the job
+# itself is `python <script> <config> <args>` from a jobs-*.yml manifest.
+openstack_image: "2026-10-14_ubuntu-26.04-glace-fleet"
+openstack_flavor: "15cpu-60ram-hpcv3"
+openstack_network: uzh-only
+openstack_keypair: lgentne-ssh-rsa
+openstack_security_groups: [default]
+cloud: openstack
+
+ansible_user: ubuntu
+ansible_python_interpreter: "{{ ansible_playbook_python }}"
+ansible_ssh_common_args: '-o GSSAPIAuthentication=no'
+
+# Where the S3 access keys live on *this* machine. Only Ansible needs this: the
+# profiles named by the *_S3_PROFILE entries in .env are read from here and
+# rendered into /home/ubuntu/secrets/aws-credentials, which the container mounts
+# and finds via AWS_SHARED_CREDENTIALS_FILE (a different, in-container path, set
+# in the image). Any other profile you keep locally stays local.
+aws_credentials_src: "{{ lookup('env', 'AWS_SHARED_CREDENTIALS_FILE') | default(lookup('env', 'HOME') + '/.aws/credentials', true) }}"
+
+# Data directory of the workers, independent of GLACIERS_DATA_DIR in the local
+# .env, which may point at a local mirror. s3://s1-bursts is the University of
+# Zurich store GLACE Alps was produced in: set your own.
+glaciers_data_dir: s3://s1-bursts/data
+
+# Compute settings for 15cpu-60ram-hpcv3
+snap_max_workers: 4
+# Leaves room for the Python orchestrator, which SNAP's overhead reserve omits.
+snap_max_ram_gb: 36

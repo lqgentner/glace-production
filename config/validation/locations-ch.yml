@@ -1,0 +1,9 @@
+# Validation locations for Switzerland: every glacier pixel of every SGI2023
+# label mask plus the 250 m ring outside the outlines.
+name: ch-sgi2023
+labels_dir: labels/sgi2023
+inventory: SGI2023
+year_column: year_acq
+years: [2021, 2022, 2023, 2024]
+pad_m: 1000
+dem: dem/glo30-alps_ellipsoid.tif

@@ -1,0 +1,228 @@
+---
+title: "CQM threshold"
+format:
+  html:
+    embed-resources: true
+jupyter: python3
+---
+
+Glacier-mapping performance of the base model (run `ablation`, feature set `all_ctx`,
+random forest) on the Swiss validation pixels, grouped by the composite quality map (CQM)
+of the pixel. The CQM is $(\sum_i W_i A_i)^{-1}$ with the resolution weights $W_i$ and
+scattering areas $A_i$ of the acquisitions of a pixel, so it is high where the contributing
+acquisitions resolve the terrain finely and low where slopes facing the sensor
+(foreshortening and layover, large $A$) dominate or only unfavourable geometries
+were available. Radar shadow has no observation and no CQM; the highest CQM lies on steep
+slopes facing away from the sensor, close to shadow.
+
+The CQM is read at every validation pixel from the composites the samples were extracted
+from (`lrw-alps`, coherence VV; the CQM of VH is identical and the backscatter CQM
+correlates at 0.95, so one threshold serves all layers). Each pixel carries its out-of-fold
+probability and is classified at the threshold of the fold that held its tile out, as in
+`compute-metrics.py`. Scores are computed per CQM bin: recall over the glacier pixels,
+the false-positive rate (FPR) over the non-glacier pixels, AUC over both. The bins also
+differ in their glacier share, so IoU and precision are not shown: they depend on the
+class balance of the bin, AUC, recall and FPR do not.
+
+```{python}
+from freezebase.raster import rasterio_open
+import matplotlib.pyplot as plt
+from matplotlib_inline.backend_inline import set_matplotlib_formats
+import numpy as np
+import pandas as pd
+from sklearn.metrics import roc_auc_score
+
+from glace_production.config import settings
+from glace_production.plotting import add_grid, set_context, set_style
+from glace_production.validation.config import DatasetConfig, RunConfig
+from glace_production.validation.store import KEY_COLUMNS, ValidationStore
+
+set_style()
+set_context("paper")
+set_matplotlib_formats("retina")
+```
+
+## Configuration
+
+```{python}
+NAME = "cqm-threshold"
+FIGURE_DIR = settings.figures_dir / NAME  # one folder per notebook
+FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+REPORT_DIR = settings.reports_dir / NAME
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+RUN = "ablation"
+FEATURE_SET = "all_ctx"
+MODEL = "rf"
+DATASET = "lrw-alps"
+CQM_PATTERN = "S1_COH12_LRW_QA-CQM_{tile}_VV_*.tif"
+
+# Bin edges of the CQM; the first bin starts at 0, the last has no upper edge
+EDGES = [0, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0, 1.5, 2.0, np.inf]
+THRESHOLDS = [0.3, 0.4, 0.5, 0.6]  # candidate masking thresholds
+CHOSEN = 0.5  # the suggested threshold, marked in the figure
+
+COLORS = {"auc": "#1f4e79", "recall": "#2a7f62", "fpr": "#b5532a", "share": "#cccccc"}
+
+# Layout in mm; Nature's maximum is 180 mm x 215 mm
+MM = 1 / 25.4
+FIG_WIDTH, FIG_HEIGHT = 180, 62
+```
+
+## Data
+
+The validation pixels of the base model with their out-of-fold predictions. Rows outside
+the run's common support are dropped, which leaves the pixels all of the run's feature sets
+are valid on.
+
+```{python}
+store = ValidationStore.default()
+run = RunConfig.from_yaml(store.run_dir(RUN) / "config.yaml")
+dataset = DatasetConfig.from_yaml(store.samples_dir(DATASET) / "config.yaml")
+
+samples = store.load_samples([DATASET], columns=[])
+support = store.read_parquet(store.support_path(RUN))
+samples = samples.merge(support[KEY_COLUMNS], on=KEY_COLUMNS, how="inner")
+pred = store.read_parquet(store.predictions_path(RUN, FEATURE_SET, MODEL))
+thr = store.read_parquet(store.thresholds_path(RUN, FEATURE_SET, MODEL)).set_index("fold")[
+    "threshold"
+]
+frame = samples.merge(pred, on=KEY_COLUMNS, how="inner", validate="one_to_one")
+assert len(frame) == len(samples), "predictions do not cover the support"
+frame["pred"] = frame["proba"] >= frame["fold"].map(thr).to_numpy()
+frame = frame[[*KEY_COLUMNS, "label", "proba", "pred"]].reset_index(drop=True)
+print(f"{len(frame):,} pixels, {int((frame.label == 1).sum()):,} glacier")
+```
+
+## CQM at the validation pixels
+
+The CQM tile of each (tile, year) pair is read once and sampled at the pixels' rows and
+columns.
+
+```{python}
+cqm = np.full(len(frame), np.nan, dtype=np.float32)
+for (tile, year), idx in frame.groupby(["tile", "year"], observed=True).indices.items():
+    comp_dir = settings.resolve_data_path(dataset.comp_dir.format(year=year))
+    (path,) = sorted(comp_dir.glob(CQM_PATTERN.format(tile=tile)))
+    with rasterio_open(path) as src:
+        band = src.read(1)
+    cqm[idx] = band[frame["row"].to_numpy()[idx], frame["col"].to_numpy()[idx]]
+frame["cqm"] = cqm
+assert np.isfinite(frame["cqm"]).all()
+frame["cqm"].describe(percentiles=[0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99]).round(3)
+```
+
+## Scores by CQM bin
+
+```{python}
+y = frame["label"].to_numpy() == 1
+hit = frame["pred"].to_numpy()
+proba = frame["proba"].to_numpy()
+bins = pd.cut(frame["cqm"], EDGES, right=False)
+
+rows = []
+for interval, idx in frame.groupby(bins, observed=True).indices.items():
+    yy, pp = y[idx], hit[idx]
+    rows.append(
+        {
+            "bin": interval,
+            "lower": interval.left,
+            "pixels": len(idx),
+            "glacier_px": int(yy.sum()),
+            "glacier_share": yy.mean(),
+            "recall": pp[yy].mean() if yy.any() else np.nan,
+            "fpr": pp[~yy].mean() if (~yy).any() else np.nan,
+            "auc": roc_auc_score(yy, proba[idx]) if yy.any() and (~yy).any() else np.nan,
+        }
+    )
+by_bin = pd.DataFrame(rows)
+by_bin["pixel_share"] = by_bin.pixels / by_bin.pixels.sum()
+by_bin["cum_pixel_share"] = by_bin.pixel_share.cumsum()
+by_bin["cum_glacier_share"] = by_bin.glacier_px.cumsum() / by_bin.glacier_px.sum()
+by_bin.drop(columns="lower").round(3).to_csv(REPORT_DIR / f"{NAME}-bins.csv", index=False)
+print(
+    f"overall AUC {roc_auc_score(y, proba):.3f}, recall {hit[y].mean():.3f}, FPR {hit[~y].mean():.3f}"
+)
+by_bin.drop(columns=["lower", "glacier_px"]).round(3)
+```
+
+## Share of pixels masked
+
+What a lower bound on the CQM removes, of all validation pixels, of the glacier pixels and
+of the non-glacier pixels.
+
+```{python}
+masked = pd.DataFrame(
+    {
+        "CQM below": THRESHOLDS,
+        "all pixels (%)": [(frame.cqm < t).mean() * 100 for t in THRESHOLDS],
+        "glacier pixels (%)": [(frame.cqm[y] < t).mean() * 100 for t in THRESHOLDS],
+        "non-glacier pixels (%)": [(frame.cqm[~y] < t).mean() * 100 for t in THRESHOLDS],
+    }
+).set_index("CQM below")
+masked.round(2).to_csv(REPORT_DIR / f"{NAME}-masked-share.csv")
+masked.round(2)
+```
+
+The AUC of the suggested threshold, pooled over the pixels below and at or above it. It is
+the number the paper quotes; it is not the mean of the bins above, as the AUC does not
+average over bins.
+
+```{python}
+low = (frame["cqm"] < CHOSEN).to_numpy()
+pooled = pd.Series(
+    {
+        f"CQM < {CHOSEN:g}": roc_auc_score(y[low], proba[low]),
+        f"CQM ≥ {CHOSEN:g}": roc_auc_score(y[~low], proba[~low]),
+        "all": roc_auc_score(y, proba),
+    },
+    name="AUC",
+)
+pooled.round(3).to_csv(REPORT_DIR / f"{NAME}-pooled-auc.csv")
+pooled.round(3)
+```
+
+## Figure
+
+AUC (a) and recall and FPR (b) per CQM bin, over the share of all pixels in each bin.
+The dashed line marks the suggested lower bound. The performance also falls at high CQM;
+the bins there hold fewer glacier pixels (a smaller glacier share) and steeper terrain facing away
+from the sensor, so a lower bound is the only masking this analysis supports.
+
+```{python}
+x = np.arange(len(by_bin))
+labels = [
+    f"<{e[1]:g}" if i == 0 else f">{e[0]:g}" if i == len(by_bin) - 1 else f"{e[0]:g}–{e[1]:g}"
+    for i, e in enumerate(zip(EDGES[:-1], EDGES[1:], strict=True))
+]
+edge_x = list(EDGES[:-1]).index(CHOSEN) - 0.5  # the chosen threshold lies between two bins
+
+fig, axes = plt.subplots(
+    1, 2, figsize=(FIG_WIDTH * MM, FIG_HEIGHT * MM), sharex=True, constrained_layout=True
+)
+for ax, letter in zip(axes, "ab", strict=True):
+    share = ax.twinx()
+    share.bar(x, by_bin.pixel_share * 100, color=COLORS["share"], width=0.8, zorder=0)
+    share.set_ylim(0, 100)
+    share.set_yticks([])
+    share.spines[:].set_visible(False)
+    ax.set_zorder(share.get_zorder() + 1)
+    ax.patch.set_visible(False)
+    ax.axvline(edge_x, color="0.3", ls="--", lw=0.8)
+    ax.set_xticks(x, labels, rotation=45, ha="right")
+    ax.set_xlabel("Composite quality map (CQM)")
+    ax.set_title(letter, loc="left", fontweight="bold")
+    add_grid(ax, "y")
+axes[0].plot(x, by_bin.auc, "o-", color=COLORS["auc"])
+axes[0].set_ylabel("AUC")
+axes[0].set_ylim(0.6, 1.0)
+axes[1].plot(x, by_bin.recall, "o-", color=COLORS["recall"], label="Recall (glacier)")
+axes[1].plot(x, by_bin.fpr, "o-", color=COLORS["fpr"], label="FPR (non-glacier)")
+# Legend entry of the bars
+axes[1].bar(np.nan, np.nan, color=COLORS["share"], label="Share of pixels")
+axes[1].set_ylabel("Score")
+axes[1].set_ylim(0, 1)
+axes[1].legend(loc="center right", frameon=False)
+with (FIGURE_DIR / f"{NAME}.pdf").open("wb") as f:
+    fig.savefig(f, format="pdf", bbox_inches=None)
+```

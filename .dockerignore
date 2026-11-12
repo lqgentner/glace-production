@@ -1,0 +1,17 @@
+# Deny everything by default, then allowlist exactly what containers/Dockerfile
+# COPYs. Local-only directories (data/, .pixi/, .venv/, notebooks/, deploy/) must
+# never be sent to the Docker daemon as build context; the deny-all first line
+# already covers every one of them.
+#
+# .git is deliberately *not* allowlisted: the version reaches hatch-vcs through
+# the VERSION build arg instead.
+*
+
+!pyproject.toml
+!pixi.lock
+!LICENSE
+!README.md
+!.gitignore
+!src/
+!scripts/
+!config/

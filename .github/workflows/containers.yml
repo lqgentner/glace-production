@@ -1,0 +1,105 @@
+name: Build and push containers
+
+# The single image built here replaced a two-workflow setup: GDAL and ESA SNAP
+# used to live in a separately published base image because installing SNAP from
+# its 2.8 GB installer on every tag pushed the runner over its disk limit. Both
+# now come from conda-forge/sarforge through pixi.lock, which is small enough to
+# resolve in one job, so containers-base.yml and containers/Dockerfile.base were
+# removed and there is no base tag left to pin.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  docker:
+    name: Build and push Docker image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+      image_version: ${{ steps.scm.outputs.tag_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # needed for hatch to compute the full SCM version
+
+      - name: Extract SCM versions
+        id: scm
+        run: |
+          RAW_VERSION=$(pipx run hatch version)
+          echo "py_version=$RAW_VERSION" >> $GITHUB_OUTPUT
+          # OCI tags don't allow +, replace with -
+          CLEAN_VERSION=$(echo $RAW_VERSION | tr '+' '-')
+          echo "tag_version=$CLEAN_VERSION" >> $GITHUB_OUTPUT
+
+      # The solved prod environment is ~3 GB and is materialised twice during a
+      # build (once in the build stage, once in the runtime stage that copies it).
+      # The runner image ships toolchains this build never uses; reclaiming them
+      # keeps the export off the disk limit.
+      - name: Free disk space
+        run: |
+          echo "Before:"
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /opt/hostedtoolcache/CodeQL
+          echo "After:"
+          df -h /
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=short
+            type=raw,value=${{ steps.scm.outputs.tag_version }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: containers/Dockerfile
+          # hatch-vcs reads this instead of .git
+          # Must be the raw PEP 440 version, not the OCI tag.
+          build-args: |
+            VERSION=${{ steps.scm.outputs.py_version }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          # mode=max because the layers worth caching are the build stage's:
+          # the two pixi installs and the shell hook never appear in the runtime
+          # image, so mode=min would export none of them and every run would
+          # re-download the whole conda environment. The cost is a larger cache
+          # blob and more staging during the export.
+          cache-to: type=gha,mode=max

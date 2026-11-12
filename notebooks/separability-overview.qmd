@@ -1,0 +1,426 @@
+---
+title: "Separability overview"
+format:
+  html:
+    embed-resources: true
+jupyter: python3
+---
+
+Class-conditional distributions of the Swiss validation samples (every glacier pixel
+plus the 250 m ring around the outlines) for each measurement layer, as split violins:
+glacier above the centre line, non-glacier below, each half with its quartiles and
+scaled to the same peak width, so the shapes compare but the heights do not. Only
+the pixel values enter, not the 5x5 window statistics the models see. Both polarisations
+compare the merged GLACE composites with the per-pass (ascending, descending)
+composites and with the Global Seasonal Sentinel-1 Interferometric Coherence and
+Backscatter Dataset of Kellndorfer et al. (2022), labelled "Global seasonal", which
+has no VH coherence. Every layer is drawn and scored on the same pixels, the common
+support: the samples where all layers of the figure are finite, so the pixels the
+merged composites fill in but a single pass or the global seasonal product misses are
+left out of all of them. The
+AUC in the figure and the AUC and JM of the table are the pooled scores of
+`scripts/validation/compute-separability.py` over that support (run with the three
+dataset configs; `glace_production.validation.separability.common_support` defines it
+for both), read from `separability/{dataset}.parquet`;
+the violins are drawn from every sample of the support, not a subsample.
+
+```{python}
+import colorsys
+from string import ascii_lowercase
+
+from matplotlib.colors import to_rgb
+import matplotlib.pyplot as plt
+from matplotlib_inline.backend_inline import set_matplotlib_formats
+import numpy as np
+import pandas as pd
+from scipy.ndimage import gaussian_filter1d
+
+from glace_production.composites import default_config_dir
+from glace_production.config import settings
+from glace_production.plotting import add_grid, set_context, set_style
+from glace_production.validation.config import DatasetConfig
+from glace_production.validation.separability import (
+    common_support,
+    common_support_name,
+    layer_features,
+    load_layer_samples,
+)
+from glace_production.validation.store import ValidationStore
+
+set_style()
+set_context("paper")
+set_matplotlib_formats("retina")
+```
+
+## Configuration
+
+```{python}
+FIGURE_NAME = "separability-overview"  # saved as {FIGURE_NAME}.pdf in FIGURE_DIR
+FIGURE_DIR = settings.figures_dir / FIGURE_NAME  # one folder per notebook
+FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+
+# The class colours of mapping-examples.qmd; each outline is a stronger shade of its fill
+CLASSES = {"Glacier": "#8EB7E0", "Non-glacier": "#DDDDDD"}
+OUTLINE_LIGHTNESS = 0.7  # factor on the fill's HLS lightness
+OUTLINE_SATURATION = 1.15  # factor on the fill's HLS saturation
+
+# (polarisation, measurement) -> {row label: (dataset, feature)}. A row a panel lacks
+# stays empty, so the rows line up across a polarisation.
+LAYERS = {
+    ("VV", "coherence"): {
+        "GLACE": ("lrw-alps", "coh_vv"),
+        "Ascending": ("pass-alps", "coh_vv_a"),
+        "Descending": ("pass-alps", "coh_vv_d"),
+        "Global seasonal": ("globalseasonal-ch", "gs_coh_vv"),
+    },
+    ("VV", "backscatter"): {
+        "GLACE": ("lrw-alps", "rtc_vv"),
+        "Ascending": ("pass-alps", "rtc_vv_a"),
+        "Descending": ("pass-alps", "rtc_vv_d"),
+        "Global seasonal": ("globalseasonal-ch", "gs_bs_vv"),
+    },
+    ("VH", "coherence"): {
+        "GLACE": ("lrw-alps", "coh_vh"),
+        "Ascending": ("pass-alps", "coh_vh_a"),
+        "Descending": ("pass-alps", "coh_vh_d"),
+    },
+    ("VH", "backscatter"): {
+        "GLACE": ("lrw-alps", "rtc_vh"),
+        "Ascending": ("pass-alps", "rtc_vh_a"),
+        "Descending": ("pass-alps", "rtc_vh_d"),
+        "Global seasonal": ("globalseasonal-ch", "gs_bs_vh"),
+    },
+}
+ROWS = {pol: ["GLACE", "Ascending", "Descending", "Global seasonal"] for pol in ("VV", "VH")}
+ROW_LABELS = {"Global seasonal": "Global\nseasonal"}  # broken to keep the left margin narrow
+BOLD_ROW = "GLACE"  # the dataset the figure presents, set in bold
+MEASUREMENTS = {  # title, x-axis label, x range; the panels from left to right
+    # narrow panels tick every 10 dB, so the range ends on 10 to have both ends ticked
+    "backscatter": ("Backscatter", "Backscatter (dB)", (-30.0, 10.0)),
+    "coherence": ("Coherence", "Coherence", (0.0, 1.0)),
+}
+LABEL_PANEL = ("VV", "backscatter")  # the class names go beside this panel's first violin
+LABEL_OFFSET = 0.25  # of the class names from the centre line, in rows
+LABEL_FADE = 0.1  # a name sits where its half has risen to, or fallen to, this share of its peak
+LABEL_PAD = 0.005  # between a name and its half, in panel widths
+
+BINS = 400  # density histogram over the x range
+SMOOTH_BINS = 2.0  # Gaussian smoothing of the histogram, in bins
+HALF_WIDTH = 0.42  # every half is scaled to this peak width, in rows
+# Line widths in points: the solid median as heavy as the outline, the dashed quartiles
+# lighter, so the median stands out by its weight and its solid line
+QUARTILE_WIDTH = 0.5
+OUTLINE_WIDTH = 0.7
+MEDIAN_WIDTH = 0.7
+
+# Layout in mm; Nature's maximum is 180 mm x 215 mm
+MM = 1 / 25.4
+FIG_WIDTH = 180
+ROW_HEIGHT = 9.0
+ROW_PAD = 0.65  # rows of padding above the first and below the last violin
+MARGIN_LEFT = 21.5  # polarisation and row labels
+POL_LABEL_X = 18.5  # polarisation labels, left of the panels
+MARGIN_RIGHT = 2.0
+MARGIN_TOP = 6.0  # column titles
+MARGIN_BOTTOM = 9.0  # x-axis labels
+COLUMN_GAP = 7.0
+GROUP_GAP = 0.7  # rows of whitespace between the VV and VH violins
+
+# A narrow panel right of the violins with one AUC dot per row and measurement
+DOTS_WIDTH = 44.0
+AUC_RANGE = (0.7, 1.0)
+AUC_TICKS = (0.7, 0.8, 0.9, 1.0)
+DOT_LABEL_OFFSET = 0.2  # of the measurement names from their dots, in rows
+DOT_SIZE = 4.0  # points; the line joining a row's dots is as thick
+# Mid grey at 16 % reads as 0.92 on white, and lets the gridlines through
+DOT_LINE_COLOR = "0.5"
+DOT_LINE_ALPHA = 0.16
+# The dots, their names and the violin panels' titles share the measurement's colour
+MEASUREMENT_COLORS = {"backscatter": "#4a9", "coherence": "#a49"}
+```
+
+## Data
+
+```{python}
+store = ValidationStore.default()
+CONFIG_DIR = default_config_dir() / "validation" / "datasets"
+datasets = sorted({d for panel in LAYERS.values() for d, _ in panel.values()})
+configs = [DatasetConfig.from_yaml(CONFIG_DIR / f"{d}.yml") for d in datasets]
+drawn = {(d, f) for panel in LAYERS.values() for d, f in panel.values()}
+assert drawn == {(c.name, f) for c in configs for f in layer_features(c)}, "LAYERS != the layers"
+
+# The common support of compute-separability.py: the rows where every layer is finite
+samples = load_layer_samples(store, configs)
+samples = samples[common_support(samples, configs)].reset_index(drop=True)
+glacier = samples["label"].to_numpy() == 1
+print(f"common support: {glacier.sum():,} glacier, {(~glacier).sum():,} non-glacier pixels")
+
+RERUN = "pixi run python scripts/validation/compute-separability.py " + " ".join(
+    f"config/validation/datasets/{d}.yml" for d in datasets
+)
+tables = pd.concat([store.read_parquet(store.separability_path(d)) for d in datasets])
+if "support" not in tables.columns:
+    raise RuntimeError(f"separability tables predate the common support; rerun: {RERUN}")
+pooled = tables[tables.group_by == "all"].set_index(["dataset", "feature"])
+# The scores must come from the same support as the violins
+scored = pooled.loc[sorted(drawn)]
+if not (
+    (scored["support"] == common_support_name(configs)).all()
+    and (scored["n_glacier"] == glacier.sum()).all()
+    and (scored["n_other"] == (~glacier).sum()).all()
+):
+    raise RuntimeError(f"separability tables are not on this common support; rerun: {RERUN}")
+
+
+def violin(values: np.ndarray, x_range: tuple[float, float]) -> dict[str, dict[str, np.ndarray]]:
+    """Smoothed density on the bin centres and quartiles of each class's finite values."""
+    edges = np.linspace(*x_range, BINS + 1)
+    out = {}
+    for name, sel in (("Glacier", glacier), ("Non-glacier", ~glacier)):
+        v = values[sel]
+        v = v[np.isfinite(v)]
+        hist, _ = np.histogram(v, bins=edges)
+        out[name] = {
+            "x": (edges[:-1] + edges[1:]) / 2,
+            "density": gaussian_filter1d(hist / (v.size * np.diff(edges)), SMOOTH_BINS),
+            "quartiles": np.quantile(v, [0.25, 0.5, 0.75]),
+        }
+    return out
+
+
+violins = {
+    (pol, kind, row): violin(samples[feature].to_numpy(np.float32), MEASUREMENTS[kind][2])
+    for (pol, kind), panel in LAYERS.items()
+    for row, (_, feature) in panel.items()
+}
+```
+
+## Table
+
+Pooled scores of every layer in the figure, with the pixels each is computed over
+(the common support, the same for every layer).
+
+```{python}
+table = pd.DataFrame(
+    [
+        {
+            "polarisation": pol,
+            "measurement": kind,
+            "product": row,
+            "dataset": dataset,
+            "feature": feature,
+            "auc": pooled.loc[(dataset, feature), "auc"],
+            "jm": pooled.loc[(dataset, feature), "jm"],
+            "n_glacier": pooled.loc[(dataset, feature), "n_glacier"],
+            "n_other": pooled.loc[(dataset, feature), "n_other"],
+        }
+        for (pol, kind), panel in LAYERS.items()
+        for row, (dataset, feature) in panel.items()
+    ]
+).set_index(["polarisation", "measurement", "product"])
+table.style.format({"auc": "{:.3f}", "jm": "{:.3f}", "n_glacier": "{:,}", "n_other": "{:,}"})
+```
+
+### LaTeX
+
+The AUC of the table as a booktabs `tabular` (`Styler.to_latex`), one row per layer
+and one column per product, the best of each row in bold. Printed for copying and
+saved as `{FIGURE_NAME}-table.tex` in `FIGURE_DIR`.
+
+```{python}
+PRODUCTS = ROWS["VV"]
+auc = table["auc"].unstack("product").reindex(columns=PRODUCTS)
+auc = auc.reindex([(pol, kind) for kind in ("coherence", "backscatter") for pol in ("VV", "VH")])
+auc.index = [f"{MEASUREMENTS[kind][0]} {pol}" for pol, kind in auc.index]
+auc.columns = pd.MultiIndex.from_product([["AUC"], PRODUCTS], names=[None, "Layer"])
+latex = (
+    auc.style.format("{:.3f}", na_rep="--")
+    .highlight_max(axis=1, props="textbf:--rwrap;")
+    .to_latex(hrules=True, multicol_align="c", column_format="l" + "c" * len(PRODUCTS))
+)
+lines = latex.splitlines()
+lines.insert(3, rf"\cmidrule(lr){{2-{len(PRODUCTS) + 1}}}")  # below the "AUC" header
+latex = "\n".join(lines)
+(FIGURE_DIR / f"{FIGURE_NAME}-table.tex").write_text(latex + "\n")
+print(latex)
+```
+
+## Figure
+
+The AUC as dots in a panel of their own beside the violins; JM is left to the table.
+
+```{python}
+def stronger(color: str) -> tuple[float, float, float]:
+    """A darker, more saturated shade of ``color`` for the violin outlines."""
+    h, l, s = colorsys.rgb_to_hls(*to_rgb(color))
+    return colorsys.hls_to_rgb(h, l * OUTLINE_LIGHTNESS, min(1.0, s * OUTLINE_SATURATION))
+
+
+# Row centres from the top: the polarisations one below the other on one x axis,
+# separated by GROUP_GAP rows of whitespace
+row_y = {}
+y = 0.0
+for pol, rows in ROWS.items():
+    for row in rows:
+        row_y[pol, row] = y
+        y -= 1
+    y -= GROUP_GAP
+y_lim = (min(row_y.values()) - ROW_PAD, ROW_PAD)
+panel_height = (y_lim[1] - y_lim[0]) * ROW_HEIGHT
+fig_height = MARGIN_TOP + panel_height + MARGIN_BOTTOM
+
+
+def auc(pol: str, kind: str, row: str) -> float:
+    dataset, feature = LAYERS[pol, kind][row]
+    return float(pooled.loc[(dataset, feature), "auc"])
+
+
+def draw_title(ax: plt.Axes, letter: str, title: str, color: str = "black") -> None:
+    """Bold ``title`` in ``color`` centred above ``ax``, and the bold panel ``letter`` on
+    its baseline above the upper-left corner."""
+    ax.set_title(title, fontweight="bold", color=color)
+    ax.annotate(
+        letter,
+        (0, 1),
+        xycoords="axes fraction",
+        xytext=(0, plt.rcParams["axes.titlepad"]),
+        textcoords="offset points",
+        ha="left",
+        va="baseline",
+        fontsize=plt.rcParams["axes.titlesize"],
+        fontweight="bold",
+    )
+
+
+def draw_violins(ax: plt.Axes, kind: str, letter: str) -> None:
+    """Split violins of one measurement, every row of ``row_y``, on one x axis."""
+    title, xlabel, x_range = MEASUREMENTS[kind]
+    for (pol, row), y in row_y.items():
+        if row not in LAYERS[pol, kind]:
+            continue
+        halves = violins[pol, kind, row]
+        for (name, half), sign in zip(halves.items(), (1, -1), strict=True):
+            width = half["density"] * HALF_WIDTH / half["density"].max()
+            edge = stronger(CLASSES[name])
+            ax.fill_between(half["x"], y, y + sign * width, facecolor=CLASSES[name], linewidth=0)
+            ax.plot(half["x"], y + sign * width, color=edge, linewidth=OUTLINE_WIDTH)
+            for k, q in enumerate(half["quartiles"]):
+                ax.plot(
+                    [q, q],
+                    [y, y + sign * np.interp(q, half["x"], width)],
+                    color=edge,
+                    linewidth=MEDIAN_WIDTH if k == 1 else QUARTILE_WIDTH,
+                    linestyle="-" if k == 1 else (0, (2, 1.5)),
+                    solid_capstyle="butt",
+                )
+        ax.axhline(y, color="0.3", linewidth=0.4)
+        # Class names on the diagonal, as in the separability panel: the glacier name right
+        # of its half, where it has fallen off, the non-glacier name left of its half, where
+        # it starts to rise
+        if (pol, kind) == LABEL_PANEL and row == ROWS[pol][0]:
+            pad = LABEL_PAD * (x_range[1] - x_range[0])
+            for (name, half), sign in zip(halves.items(), (1, -1), strict=True):
+                risen = half["x"][half["density"] > LABEL_FADE * half["density"].max()]
+                right = sign == 1
+                ax.text(
+                    risen[-1] + pad if right else risen[0] - pad,
+                    y + sign * LABEL_OFFSET,
+                    name,
+                    ha="left" if right else "right",
+                    va="center",
+                    color=stronger(CLASSES[name]),
+                )
+    ax.set_ylim(*y_lim)
+    ax.set_xlim(*x_range)
+    ax.spines["left"].set_visible(False)
+    first = kind == next(iter(MEASUREMENTS))
+    ax.set_yticks(
+        list(row_y.values()), [ROW_LABELS.get(row, row) for _, row in row_y] if first else []
+    )
+    for label in ax.get_yticklabels():
+        if label.get_text() == BOLD_ROW:
+            label.set_fontweight("bold")
+    ax.tick_params(axis="y", length=0)
+    draw_title(ax, letter, title, MEASUREMENT_COLORS[kind])
+    ax.set_xlabel(xlabel)
+
+
+def draw_dots(ax: plt.Axes, letter: str) -> None:
+    """One AUC dot per row and measurement, joined per row, named on the first row."""
+    for (pol, row), y in row_y.items():
+        values = {kind: auc(pol, kind, row) for kind in MEASUREMENTS if row in LAYERS[pol, kind]}
+        ax.plot(
+            list(values.values()),
+            [y] * len(values),
+            color=DOT_LINE_COLOR,
+            alpha=DOT_LINE_ALPHA,
+            linewidth=DOT_SIZE,
+            solid_capstyle="butt",
+            zorder=1,
+        )
+        for kind, value in values.items():
+            ax.plot(
+                value,
+                y,
+                marker="o",
+                markersize=DOT_SIZE,
+                markeredgewidth=0,
+                color=MEASUREMENT_COLORS[kind],
+                linestyle="none",
+                zorder=2,
+            )
+            if (pol, row) == next(iter(row_y)):
+                # Coherence named above its dot, backscatter below, so the names never meet
+                above = kind == "coherence"
+                ax.text(
+                    value,
+                    y + (DOT_LABEL_OFFSET if above else -DOT_LABEL_OFFSET),
+                    MEASUREMENTS[kind][0],
+                    ha="center",
+                    va="bottom" if above else "top",
+                    color=MEASUREMENT_COLORS[kind],
+                )
+    ax.set_ylim(*y_lim)
+    ax.set_xlim(*AUC_RANGE)
+    ax.set_xticks(AUC_TICKS)
+    ax.set_yticks([])
+    ax.spines["left"].set_visible(False)
+    add_grid(ax, axis="x", linewidth=0.4)
+    draw_title(ax, letter, "Separability")
+    ax.set_xlabel("AUC")
+
+
+def rect(x: float, y: float, width: float, height: float) -> tuple[float, float, float, float]:
+    """Figure-fraction rectangle of a box at (x, y) mm from the top-left corner."""
+    return (x / FIG_WIDTH, 1 - (y + height) / fig_height, width / FIG_WIDTH, height / fig_height)
+
+
+panel_width = (
+    FIG_WIDTH - MARGIN_LEFT - MARGIN_RIGHT - len(MEASUREMENTS) * COLUMN_GAP - DOTS_WIDTH
+) / len(MEASUREMENTS)
+print(f"figure {FIG_WIDTH} mm x {fig_height:.1f} mm, violin panels {panel_width:.1f} mm wide")
+fig = plt.figure(figsize=(FIG_WIDTH * MM, fig_height * MM))
+x = MARGIN_LEFT
+letters = iter(ascii_lowercase)
+for kind in MEASUREMENTS:
+    ax = fig.add_axes(rect(x, MARGIN_TOP, panel_width, panel_height))
+    draw_violins(ax, kind, next(letters))
+    if kind == next(iter(MEASUREMENTS)):
+        # Polarisation labels, centred on their rows
+        for pol, rows in ROWS.items():
+            ax.text(
+                -POL_LABEL_X / panel_width,
+                np.mean([row_y[pol, r] for r in rows]),
+                pol,
+                transform=ax.get_yaxis_transform(),
+                rotation=90,
+                va="center",
+                ha="center",
+                fontweight="bold",
+                fontsize=plt.rcParams["axes.titlesize"],
+            )
+    x += panel_width + COLUMN_GAP
+draw_dots(fig.add_axes(rect(x, MARGIN_TOP, DOTS_WIDTH, panel_height)), next(letters))
+with (FIGURE_DIR / f"{FIGURE_NAME}.pdf").open("wb") as f:
+    fig.savefig(f, format="pdf", bbox_inches=None)
+```

@@ -1,0 +1,654 @@
+---
+title: "Dataset overview"
+format:
+  html:
+    embed-resources: true
+jupyter: python3
+---
+
+Alps-wide overview of the dataset: VV coherence and VV backscatter of one year, read
+from the ETRS89-LAEA mosaics of the published release on Source Cooperative and cut to
+the Alpine Convention perimeter. The basemap is Natural Earth (public domain, no
+attribution needed): gray land, and lakes and a sea in the style of old maps, darker
+along the shoreline. The dataset extent (the footprint of the MGRS tiles of the
+`alps-total` scope, which the published tiles cover) is drawn as a vector, and the windows of the local resolution
+weighting figure and the mapping examples are marked on the backscatter panel. Those
+windows come from `regions.py` beside this notebook, which `lrw-effect.qmd` and
+`mapping-examples.qmd` read too.
+
+The lower-right corner of each panel is cut out of the map, where the colorbar, the
+legend and (on the lower panel) the scalebar sit on the white of the page.
+
+```{python}
+from string import ascii_lowercase
+
+import cartopy.crs as ccrs
+from cartopy.mpl.ticker import LatitudeFormatter, LongitudeFormatter
+import cmcrameri.cm as cmc
+import geopandas as gpd
+from matplotlib import patheffects
+from matplotlib.colors import to_rgb
+from matplotlib.font_manager import FontProperties
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch, Rectangle
+from matplotlib.path import Path
+from matplotlib.textpath import TextPath
+from matplotlib.transforms import Bbox
+import matplotlib.pyplot as plt
+from matplotlib_inline.backend_inline import set_matplotlib_formats
+import numpy as np
+import rasterio
+from rasterio.features import geometry_mask
+from rasterio.transform import array_bounds
+from rasterio.windows import from_bounds
+from shapely import LineString, Point, box, count_coordinates, get_parts, union_all
+
+from glace_production.config import settings
+from data_paths import run_scope
+from glace_production.datasets import (
+    AlpineConventionPerimeter,
+    NaturalEarthCountries,
+    NaturalEarthLakes,
+)
+from glace_production.plotting import add_scalebar, set_context, set_style
+from regions import LRW_REGION, REGION_EPSG, REGIONS, region_bounds
+from tiles import scope_tiles
+
+set_style()
+set_context("paper")
+set_matplotlib_formats("retina")
+```
+
+## Configuration
+
+```{python}
+YEAR = 2026
+POL = "VV"
+# The published release, read over HTTP: the mosaics exist nowhere else
+MOSAICS_URL = "https://data.source.coop/giuz/glace-alps/mosaics"
+
+# The 2-98 % range inside the perimeter, rounded; the percentiles are printed to
+# compare against. The mapping examples have their own, wider stretch.
+STRETCH_PERCENTILES = (2, 98)
+RTC_VMIN, RTC_VMAX = -13, -4
+RTC_CMAP = cmc.navia
+COH_VMIN, COH_VMAX = 0.1, 0.7
+COH_CMAP = cmc.lipari
+RTC_LABEL = f"{POL} backscatter (dB)"
+COH_LABEL = f"{POL} coherence"
+RTC_TICKS = np.arange(RTC_VMIN, RTC_VMAX + 1e-6, 3)  # labels at both ends of the bar
+COH_TICKS = np.arange(COH_VMIN, COH_VMAX + 1e-6, 0.2)  # labels at both ends of the bar
+
+# Basemap
+LAND_COLOR = "#f7f7f7"  # gray
+EXTENT_COLOR = "black"  # the published tiles, translucent so the sea shows through
+EXTENT_ALPHA = 0.2
+# The sea: the hue of SHORE_COLOR (L* 81, C* 11) at L* 93 and C* 6, so it looks as gray
+# as the coast and the fade from it is mostly a change in lightness
+WATER_COLOR = "#deeef3"
+SHORE_COLOR = "#b1cdd7"  # the sea along the coast, fading into WATER_COLOR
+SHORE_FADE_KM = 10.0  # e-folding distance of that fade
+FADE_STEPS = 48  # vector bands per fade, each an equal share of its colour change
+FADE_SIMPLIFY = 0.05  # band outlines simplified by this fraction of their distance from the shore
+# Lakes: the sea's hue (228°) and its lightness step of 12, darker so small lakes stand
+# out: L* 70, C* 13 along the shore, fading to L* 82, C* 9 in the middle
+LAKE_COLOR = "#b9d0d8"
+LAKE_SHORE_COLOR = "#8fb1bc"
+LAKE_FADE_KM = 5.0
+LAKE_MAX_DISTANCE_KM = 50.0  # lakes farther from the perimeter are left out
+PERIMETER_SIMPLIFY_M = 100.0  # a third of a pixel at 450 dpi, a quarter of the vertices
+REGION_COLOR = "#ab5563"
+# White stroke around the windows, their labels and connectors, in line widths; the
+# windows are drawn at the patch line width of set_context
+REGION_GLOW = 1.5
+CALLOUT_GAP_PT = 1.5  # between the connector and the window, and the connector and the label
+# Figure numbers
+LRW_FIGURE = 1
+MAPPING_FIGURE = 4
+# Each label sits LABEL_OFFSET_KM beyond the dataset extent, along a ray from its
+# window at this azimuth (degrees clockwise from north), which also draws the connector
+REGION_LABEL_AZIMUTH_DEG = {
+    "Gurgler Ferner": 7.5,
+    "Grosser Aletschgletscher": -15,
+    "Gornergletscher": -22.5,
+    "Unteraargletscher": 7.5,
+}
+LABEL_OFFSET_KM = 25.0
+GRID_ALPHA = 0.2
+GRID_LON_DEG = 2
+GRID_LAT_DEG = 1
+# Latitudes are labelled left of both panels, longitudes below the lower one
+GRID_LON_LABEL_EVERY = 1  # of the meridians, the labelled ones
+GRID_LAT_LABEL_EVERY = 2  # of the parallels, the labelled ones
+PAD_KM = 10.0  # map extent beyond the perimeter and the tiles
+
+# Layout in mm; Nature's maximum is 180 mm x 215 mm. The panel width follows from the
+# margins and the height from the map extent; the width is reduced below FIG_WIDTH when
+# the two panels would not fit FIG_MAX_HEIGHT (set it to None for the full width).
+MM = 1 / 25.4
+DPI = 450
+FIG_WIDTH = 180
+FIG_MAX_HEIGHT = 215
+MARGIN = 0.5  # around the panels, where nothing is drawn
+GRID_LABEL_WIDTH = 3.2  # left of the panels, for the latitude labels
+GRID_LABEL_HEIGHT = 3.2  # below the lower panel, for the longitude labels
+TITLE_PAD = 2.0  # between the title inside the panel's upper-left corner and its edges
+TITLE_GAP = 9.0  # between the panel letter and the title, in points: wide, so they read apart
+TITLE_BOX_PAD = 2.0  # LAND_COLOR box behind the title, below and right of its ink, in points
+SCALEBAR_FONTSIZE = 7  # pt, one step below the body text: an annotation on the map
+GAP = 3.0  # between the panels
+COLORBAR_LENGTH = 42.0
+COLORBAR_HEIGHT = 2.2
+LEGEND_GAP = 2.0  # between a colorbar's ticks and the legend above it
+SCALEBAR_PAD = 3.0  # between the scalebar and the bottom of the lower panel
+NOTCH_GAP = 2.5  # between the map and what sits in its cut-out corner
+
+coh_file = f"{MOSAICS_URL}/{YEAR}/coh12_{POL.lower()}.tif"
+rtc_file = f"{MOSAICS_URL}/{YEAR}/rtc_{POL.lower()}.tif"
+FIGURE_NAME = "dataset-overview"  # saved as {FIGURE_NAME}.pdf in FIGURE_DIR
+FIGURE_DIR = settings.figures_dir / FIGURE_NAME  # one folder per notebook
+FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+```
+
+## Compositing window
+
+The period the composites cover, for the figure caption, from the mosaics' own tags.
+
+```{python}
+windows = set()
+for path in (coh_file, rtc_file):
+    with rasterio.open(path) as src:
+        tags = src.tags()
+    windows.add((tags["COMPOSITE_START_DATE"], tags["COMPOSITE_END_DATE"]))
+assert len(windows) == 1, windows
+start, end = windows.pop()
+print(f"{start}–{end}")
+```
+
+## Vectors
+
+Everything is projected to the mosaic CRS (ETRS89-LAEA, EPSG:3035). The map extent is the
+padded union of the perimeter and the dataset extent.
+
+```{python}
+with rasterio.open(rtc_file) as src:
+    EPSG = src.crs.to_epsg()
+    overview_factors = src.overviews(1)
+CRS = ccrs.epsg(EPSG)
+
+perimeter = AlpineConventionPerimeter().get_data().to_crs(EPSG).union_all()
+perimeter = perimeter.simplify(PERIMETER_SIMPLIFY_M)
+dataset_extent = scope_tiles(run_scope()).to_crs(EPSG).union_all()
+
+pad = PAD_KM * 1000
+left, bottom, right, top = np.array(perimeter.union(dataset_extent).bounds) + [
+    -pad,
+    -pad,
+    pad,
+    pad,
+]
+extent = (left, right, bottom, top)
+print(f"extent {(right - left) / 1000:.0f} km x {(top - bottom) / 1000:.0f} km")
+
+# Land and lakes within reach of the map only, so the PDF does not carry the rest of
+# the world. The countries are merged into one land polygon, since adjacent polygons
+# leave anti-aliasing seams along the borders. The global lakes layer holds the large
+# lakes, the European supplement the smaller ones.
+reach = 5 * SHORE_FADE_KM * 1000
+ocean_extent = (left - reach, right + reach, bottom - reach, top + reach)
+ocean_box = box(ocean_extent[0], ocean_extent[2], ocean_extent[1], ocean_extent[3])
+land = NaturalEarthCountries(resolution="10m").get_data().to_crs(EPSG).clip(ocean_box).union_all()
+lakes = union_all(
+    [
+        NaturalEarthLakes(resolution="10m").get_data().to_crs(EPSG).union_all(),
+        NaturalEarthLakes(resolution="10m", supplement="europe")
+        .get_data()
+        .to_crs(EPSG)
+        .union_all(),
+    ]
+).intersection(ocean_box)
+# Only the lakes near the perimeter, not those out at the edges of the map
+near = [
+    lake for lake in get_parts(lakes) if lake.distance(perimeter) <= LAKE_MAX_DISTANCE_KM * 1000
+]
+print(
+    f"{len(near)} of {len(get_parts(lakes))} lakes within {LAKE_MAX_DISTANCE_KM:.0f} km of the perimeter"
+)
+lakes = union_all(near)
+
+# The example windows and their figure labels, from UTM 32N into the mosaic CRS, and
+# where their labels sit: where the ray from the window leaves the dataset extent, plus
+# the offset
+callouts = {
+    str(LRW_FIGURE): LRW_REGION,
+    **{f"{MAPPING_FIGURE}{c}": r for c, r in zip(ascii_lowercase, REGIONS, strict=False)},
+}
+regions = gpd.GeoSeries(
+    [box(*region_bounds(r)) for r in callouts.values()], crs=REGION_EPSG
+).to_crs(EPSG)
+labels = []
+for geom, region in zip(regions, callouts.values(), strict=True):
+    azimuth = np.radians(REGION_LABEL_AZIMUTH_DEG[region["name"]])
+    direction = np.array([np.sin(azimuth), np.cos(azimuth)])
+    origin = np.array([geom.centroid.x, geom.centroid.y])
+    ray = LineString([origin, origin + 2000e3 * direction])
+    crossings = get_parts(ray.intersection(dataset_extent.boundary))
+    exit_point = max(crossings, key=lambda p: p.distance(geom.centroid))
+    labels.append(
+        Point(np.array([exit_point.x, exit_point.y]) + LABEL_OFFSET_KM * 1000 * direction)
+    )
+```
+
+## Rasters
+
+The overview level is the coarsest one that still gives the panel 450 dpi. The rasters
+are read for the map extent only and masked outside the perimeter. The percentiles of
+what remains are printed to check the stretch against.
+
+```{python}
+aspect = (top - bottom) / (right - left)
+target_px = (FIG_WIDTH - 2 * MARGIN) * MM * DPI
+with rasterio.open(rtc_file) as src:
+    window = from_bounds(left, bottom, right, top, transform=src.transform)
+    window = window.round_offsets().round_lengths()
+    factor = max([1, *(f for f in overview_factors if window.width / f >= target_px)])
+    out_shape = (round(window.height / factor), round(window.width / factor))
+    print(f"overview 1/{factor}: {out_shape[1]} x {out_shape[0]} px for {target_px:.0f} px")
+    rtc = src.read(1, window=window, out_shape=out_shape, masked=True, boundless=True)
+    raster_transform = src.window_transform(window) * src.transform.scale(factor)
+    west, south, east, north = array_bounds(*out_shape, raster_transform)
+    raster_extent = (west, east, south, north)
+with rasterio.open(coh_file) as src:
+    coh = src.read(1, window=window, out_shape=out_shape, masked=True, boundless=True)
+
+outside = geometry_mask([perimeter], out_shape=out_shape, transform=raster_transform)
+with np.errstate(divide="ignore", invalid="ignore"):
+    rtc_db = np.ma.masked_where(outside, 10 * np.log10(rtc))
+coh = np.ma.masked_where(outside, coh)
+
+rtc_lo, rtc_hi = np.percentile(rtc_db.compressed(), STRETCH_PERCENTILES).round(1)
+coh_lo, coh_hi = np.percentile(coh.compressed(), STRETCH_PERCENTILES).round(2)
+print(
+    f"{STRETCH_PERCENTILES} %: backscatter {rtc_lo} to {rtc_hi} dB, coherence {coh_lo} to {coh_hi}"
+)
+print(f"stretch: backscatter {RTC_VMIN} to {RTC_VMAX} dB, coherence {COH_VMIN} to {COH_VMAX}")
+```
+
+## Water
+
+The fade from the shore colour into the water colour as vector bands, so the figure
+stays sharp at any zoom: the fade is cut into `FADE_STEPS` equal colour steps, and each
+step is the water within the distance from the shore where the fade reaches it. The sea
+steps are the land buffered outwards, painted from the open sea towards the coast; the
+lake steps are the lakes buffered inwards, painted from the shore towards the middle.
+Land beyond the map extent is included so the distances are right at its edges.
+
+```{python}
+def fade_steps(shore: str, far: str, fade_km: float) -> tuple[np.ndarray, np.ndarray]:
+    """Distance from the shore (m) where each step of the fade begins, and its RGB."""
+    step = np.arange(FADE_STEPS)
+    starts = -fade_km * 1000 * np.log(1 - step / FADE_STEPS)
+    fade = (step + 0.5) / FADE_STEPS
+    return starts, (1 - fade[:, None]) * np.array(to_rgb(shore)) + fade[:, None] * np.array(
+        to_rgb(far)
+    )
+
+
+def band(geom, distance: float):
+    """``geom`` buffered by ``distance`` m, simplified in proportion to it."""
+    return geom.buffer(distance, quad_segs=2).simplify(abs(distance) * FADE_SIMPLIFY)
+
+
+# The sea bands are clipped to the map, just beyond it so its edge shows no seam
+frame = box(left, bottom, right, top).buffer(1000, join_style="mitre")
+starts, colors = fade_steps(SHORE_COLOR, WATER_COLOR, SHORE_FADE_KM)
+sea_bands = [(colors[-1], frame)] + [
+    (color, band(land, end).intersection(frame))
+    for color, end in zip(colors[-2::-1], starts[:0:-1], strict=True)
+]
+
+starts, colors = fade_steps(LAKE_SHORE_COLOR, LAKE_COLOR, LAKE_FADE_KM)
+lake_bands = [(colors[0], lakes)] + [
+    (color, band(lakes, -start)) for color, start in zip(colors[1:], starts[1:], strict=True)
+]
+lake_bands = [(color, geom) for color, geom in lake_bands if not geom.is_empty]
+vertices = count_coordinates([geom for _, geom in sea_bands + lake_bands])
+print(f"{len(sea_bands)} sea and {len(lake_bands)} lake bands, {vertices} vertices")
+```
+
+## Panels
+
+The panel geometry from the margins, and what is drawn inside a panel.
+
+```{python}
+def layout() -> dict[str, float]:
+    """Figure and panel sizes in mm, within Nature's limits."""
+    # Only the lower panel has longitude labels below it
+    fixed_height = 2 * MARGIN + GAP + GRID_LABEL_HEIGHT
+    panel_w = FIG_WIDTH - 2 * MARGIN - GRID_LABEL_WIDTH
+    if FIG_MAX_HEIGHT is not None:
+        panel_w = min(panel_w, (FIG_MAX_HEIGHT - fixed_height) / (2 * aspect))
+    panel_h = panel_w * aspect
+    dims = {
+        "fig_w": panel_w + 2 * MARGIN + GRID_LABEL_WIDTH,
+        "fig_h": fixed_height + 2 * panel_h,
+        "panel_w": panel_w,
+        "panel_h": panel_h,
+        "panel_x": MARGIN + GRID_LABEL_WIDTH,
+        "panel_y": [MARGIN + i * (panel_h + GAP) for i in range(2)],
+    }
+    print(
+        f"figure {dims['fig_w']:.1f} mm x {dims['fig_h']:.1f} mm, panels {panel_w:.1f} mm x {panel_h:.1f} mm"
+    )
+    return dims
+
+
+def rect(
+    dims, x: float, y: float, width: float, height: float
+) -> tuple[float, float, float, float]:
+    """Figure-fraction rectangle of a box at (x, y) mm from the top-left corner."""
+    return (
+        x / dims["fig_w"],
+        1 - (y + height) / dims["fig_h"],
+        width / dims["fig_w"],
+        height / dims["fig_h"],
+    )
+
+
+def draw_basemap(ax) -> None:
+    """Sea, land, lakes and the dataset extent below the data."""
+    ax.set_extent(extent, crs=CRS)
+    # Bands of one zorder are drawn in the order they are added
+    for color, geom in sea_bands:
+        ax.add_geometries([geom], crs=CRS, facecolor=color, edgecolor="none", zorder=0)
+    ax.add_geometries([land], crs=CRS, facecolor=LAND_COLOR, edgecolor="none", zorder=1)
+    for color, geom in lake_bands:
+        ax.add_geometries([geom], crs=CRS, facecolor=color, edgecolor="none", zorder=2)
+    ax.add_geometries(
+        [dataset_extent],
+        crs=CRS,
+        facecolor=EXTENT_COLOR,
+        alpha=EXTENT_ALPHA,
+        edgecolor="none",
+        zorder=3,
+    )
+
+
+def draw_grid(ax, lon_labels: bool) -> None:
+    """Faint graticule below the rasters, latitudes (and ``lon_labels``) labelled."""
+    lines = ax.gridlines(
+        crs=ccrs.PlateCarree(),
+        xlocs=np.arange(-180, 180, GRID_LON_DEG),
+        ylocs=np.arange(-90, 90, GRID_LAT_DEG),
+        alpha=GRID_ALPHA,
+        linewidth=plt.rcParams["grid.linewidth"],
+        color="black",
+    )
+    # The Gridliner is one artist whose own zorder decides where its lines are drawn:
+    # above the dataset extent, below the rasters
+    lines.set_zorder(3.5)
+    # A second Gridliner for the labels, which draws no lines
+    labels = ax.gridlines(
+        crs=ccrs.PlateCarree(),
+        draw_labels={"left": "y", "bottom": "x"} if lon_labels else {"left": "y"},
+        xlocs=np.arange(-180, 180, GRID_LON_LABEL_EVERY * GRID_LON_DEG),
+        ylocs=np.arange(-90, 90, GRID_LAT_LABEL_EVERY * GRID_LAT_DEG),
+        xformatter=LongitudeFormatter(),
+        yformatter=LatitudeFormatter(),
+        x_inline=False,
+        y_inline=False,
+        rotate_labels=False,
+        xpadding=plt.rcParams["xtick.major.pad"],
+        ypadding=plt.rcParams["ytick.major.pad"],
+    )
+    labels.xlines = labels.ylines = False
+    labels.ylabel_style = {"rotation": 90, "va": "center"}
+
+
+def draw_examples(ax) -> None:
+    """The example windows, each connected to its label outside the extent."""
+    linewidth = plt.rcParams["patch.linewidth"]
+    glow_width = REGION_GLOW * linewidth
+    glow = [patheffects.withStroke(linewidth=linewidth + glow_width, foreground="white")]
+    text_glow = [patheffects.withStroke(linewidth=glow_width, foreground="white")]
+    # The connector runs from the label's anchor to the nearest point of the window, and
+    # stops the same distance short of the label's ink and the window's line; the glows
+    # would otherwise eat into its ends. The label is anchored at the edge of its ink
+    # facing the window: its baseline if above the window, its top if below.
+    shrink = CALLOUT_GAP_PT + glow_width / 2
+    for text, geom, label in zip(callouts, regions, labels, strict=True):
+        ax.plot(
+            *geom.exterior.xy,
+            color=REGION_COLOR,
+            linewidth=linewidth,
+            path_effects=glow,
+            zorder=8,
+        )
+        start = geom.exterior.interpolate(geom.exterior.project(label))
+        ax.text(
+            label.x,
+            label.y,
+            text,
+            ha="center",
+            va="baseline" if label.y > start.y else "top",
+            color=REGION_COLOR,
+            fontsize=plt.rcParams["legend.fontsize"],
+            fontweight="bold",
+            path_effects=text_glow,
+            zorder=9,
+        )
+        ax.annotate(
+            "",
+            (start.x, start.y),
+            xytext=(label.x, label.y),
+            arrowprops={
+                "arrowstyle": "-",
+                "color": REGION_COLOR,
+                "linewidth": linewidth,
+                "shrinkA": shrink,
+                "shrinkB": shrink + linewidth / 2,
+                "path_effects": glow,
+            },
+            zorder=9,
+        )
+
+
+def draw_panels(fig, dims):
+    """Both panels with everything but the cut-out corner; returns them and the images."""
+    axs = [
+        fig.add_axes(
+            rect(dims, dims["panel_x"], y, dims["panel_w"], dims["panel_h"]), projection=CRS
+        )
+        for y in dims["panel_y"]
+    ]
+    kwargs = {
+        "extent": raster_extent,
+        "transform": CRS,
+        "origin": "upper",
+        "interpolation": "nearest",
+        "zorder": 4,
+    }
+    for ax in axs:
+        draw_basemap(ax)
+    coh_im = axs[0].imshow(coh, cmap=COH_CMAP, vmin=COH_VMIN, vmax=COH_VMAX, **kwargs)
+    rtc_im = axs[1].imshow(rtc_db, cmap=RTC_CMAP, vmin=RTC_VMIN, vmax=RTC_VMAX, **kwargs)
+    for ax in axs:
+        draw_grid(ax, lon_labels=ax is axs[-1])
+    draw_examples(axs[1])
+    for ax in axs:
+        ax.spines["geo"].set_visible(False)  # no frame, the graticule labels stay
+    for ax, letter, layer in zip(axs, "ab", ("coherence", "backscatter"), strict=True):
+        draw_title(ax, letter, f"GLACE {layer} ({YEAR})")
+    return axs, coh_im, rtc_im
+
+
+def draw_title(ax, letter: str, title: str) -> None:
+    """Bold panel ``letter`` in the upper-left corner, followed by the bold ``title``."""
+    pad = TITLE_PAD / 25.4 * 72
+    font = FontProperties(size=plt.rcParams["axes.titlesize"], weight="bold")
+    size = font.get_size_in_points()
+    # Both on one baseline, the letter's cap height of the current font below TITLE_PAD
+    cap_height = TextPath((0, 0), "H", prop=font).get_extents().height
+    baseline = -pad - cap_height
+    kwargs = {
+        "textcoords": "offset points",
+        "fontsize": size,
+        "ha": "left",
+        "va": "baseline",
+        "fontweight": "bold",
+        "zorder": 9,
+    }
+    head = ax.annotate(
+        letter,
+        (0, 1),
+        xycoords="axes fraction",
+        xytext=(pad, baseline),
+        **kwargs,
+    )
+    # Continued from the letter's right edge
+    tail = ax.annotate(
+        title,
+        (1, 1),
+        xycoords=(head, "axes fraction"),
+        xytext=(TITLE_GAP, baseline),
+        **kwargs,
+    )
+    # A LAND_COLOR box from the panel's corner to TITLE_BOX_PAD beyond the ink, so no
+    # gridline shows between the title and the panel's edges
+    renderer = ax.figure.canvas.get_renderer()
+    ink = Bbox.union([head.get_window_extent(renderer), tail.get_window_extent(renderer)])
+    box_pad = TITLE_BOX_PAD / 72 * ax.figure.dpi
+    corner = ax.transAxes.inverted().transform([(ink.x1 + box_pad, ink.y0 - box_pad)])[0]
+    ax.add_patch(
+        Rectangle(
+            (0, corner[1]),
+            corner[0],
+            1 - corner[1],
+            transform=ax.transAxes,
+            facecolor=LAND_COLOR,
+            edgecolor="none",
+            zorder=8.9,
+        )
+    )
+
+
+def extend(values: np.ndarray, vmin: float, vmax: float) -> str:
+    """Colorbar ``extend`` for the ends of ``[vmin, vmax]`` the values exceed."""
+    return ("neither", "min", "max", "both")[(values.min() < vmin) + 2 * (values.max() > vmax)]
+
+
+# Label, ticks and arrows of the colorbars of the upper and the lower panel
+COLORBARS = [
+    {"label": COH_LABEL, "ticks": COH_TICKS, "extend": extend(coh, COH_VMIN, COH_VMAX)},
+    {"label": RTC_LABEL, "ticks": RTC_TICKS, "extend": extend(rtc_db, RTC_VMIN, RTC_VMAX)},
+]
+print("colorbar arrows:", {bar["label"]: bar["extend"] for bar in COLORBARS})
+
+
+def legend_entries() -> list[dict[str, list]]:
+    """``handles`` and ``labels`` of the legends of the upper and the lower panel."""
+    extent_handle = Patch(facecolor=EXTENT_COLOR, alpha=EXTENT_ALPHA, edgecolor="none")
+    examples_handle = Line2D(
+        [],
+        [],
+        linestyle="none",
+        marker="s",
+        markersize=plt.rcParams["lines.markersize"],
+        markerfacecolor="none",
+        markeredgecolor=REGION_COLOR,
+        markeredgewidth=plt.rcParams["patch.linewidth"],
+    )
+    return [
+        {"handles": [extent_handle], "labels": ["Dataset extent"]},
+        {
+            "handles": [examples_handle],
+            "labels": [f"Windows of Figs. {LRW_FIGURE} and {MAPPING_FIGURE}"],
+        },
+    ]
+
+
+for text, region in callouts.items():
+    print(f"{text}: {region['name']} ({region['year']})")
+```
+
+## Figure
+
+The colorbar and legend of each panel are stacked in its lower-right corner, measured
+with their labels and moved flush with the panel's right and bottom edge; the scalebar
+sits at the bottom centre of the lower panel. The corner they take, plus `NOTCH_GAP`, is cut
+out of both panels alike, and checked to hold neither tiles nor perimeter.
+
+```{python}
+dims = layout()
+fig = plt.figure(figsize=(dims["fig_w"] * MM, dims["fig_h"] * MM))
+axs, coh_im, rtc_im = draw_panels(fig, dims)
+
+# Each colorbar with its legend LEGEND_GAP above its ticks and centred on the bar; laid
+# out at the panel's bottom, then moved so that both end flush with its right and
+# bottom edge
+caxs, legends = [], []
+for ax, y, im, bar, entries in zip(
+    axs, dims["panel_y"], (coh_im, rtc_im), COLORBARS, legend_entries(), strict=True
+):
+    x = dims["panel_x"] + dims["panel_w"] - COLORBAR_LENGTH
+    cax = fig.add_axes(
+        rect(dims, x, y + dims["panel_h"] - COLORBAR_HEIGHT, COLORBAR_LENGTH, COLORBAR_HEIGHT)
+    )
+    fig.colorbar(im, cax=cax, orientation="horizontal", **bar)
+    caxs.append(cax)
+    legends.append(
+        fig.legend(**entries, loc="lower center", borderaxespad=0, borderpad=0, frameon=False)
+    )
+
+renderer = fig.canvas.get_renderer()
+to_figure = fig.transFigure.inverted()
+for ax, cax, legend in zip(axs, caxs, legends, strict=True):
+    ticks = cax.get_tightbbox(renderer).transformed(to_figure)
+    position = cax.get_position()
+    anchor = ((position.x0 + position.x1) / 2, ticks.y1 + LEGEND_GAP / dims["fig_h"])
+    legend.set_bbox_to_anchor(anchor, transform=fig.transFigure)
+    content = Bbox.union([ticks, legend.get_window_extent(renderer).transformed(to_figure)])
+    panel = ax.get_position()
+    dx, dy = panel.x1 - content.x1, panel.y0 - content.y0
+    cax.set_position(position.translated(dx, dy))
+    legend.set_bbox_to_anchor((anchor[0] + dx, anchor[1] + dy), transform=fig.transFigure)
+
+add_scalebar(
+    axs[1],
+    style="filled",
+    loc="lower center",
+    bbox_to_anchor=(0.5, SCALEBAR_PAD / dims["panel_h"]),
+    bbox_transform=axs[1].transAxes,
+    borderpad=0,
+    linewidth=plt.rcParams["axes.linewidth"],
+    prop=FontProperties(size=SCALEBAR_FONTSIZE),
+)
+
+# The corner to cut, in axes fractions: as wide as the wider content of the two panels,
+# as high as each panel's own, so the gap above the legends is the same
+fig.canvas.draw()
+contents = [
+    Bbox.union([cax.get_tightbbox(renderer), legend.get_window_extent(renderer)]).transformed(
+        ax.transAxes.inverted()
+    )
+    for ax, cax, legend in zip(axs, caxs, legends, strict=True)
+]
+notch_w = max(1 - content.x0 for content in contents) + NOTCH_GAP / dims["panel_w"]
+x0, x1, y0, y1 = axs[0].get_extent(crs=CRS)
+for ax, content in zip(axs, contents, strict=True):
+    notch_h = content.y1 + NOTCH_GAP / dims["panel_h"]
+    print(
+        f"cut-out corner {notch_w * dims['panel_w']:.1f} mm x {notch_h * dims['panel_h']:.1f} mm"
+    )
+    corner = box(x1 - notch_w * (x1 - x0), y0, x1, y0 + notch_h * (y1 - y0))
+    assert not corner.intersects(perimeter.union(dataset_extent)), "the cut-out corner covers data"
+    outline = Path(
+        [(0, 0), (1 - notch_w, 0), (1 - notch_w, notch_h), (1, notch_h), (1, 1), (0, 1), (0, 0)],
+        closed=True,
+    )
+    ax.set_boundary(outline, transform=ax.transAxes)
+
+# At the size the layout gives it, not cropped to its ink like the notebook preview
+with (FIGURE_DIR / f"{FIGURE_NAME}.pdf").open("wb") as f:
+    fig.savefig(f, format="pdf", bbox_inches=None)
+```

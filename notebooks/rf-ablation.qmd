@@ -1,0 +1,390 @@
+---
+title: "Random forest ablation"
+format:
+  html:
+    embed-resources: true
+jupyter: python3
+---
+
+Pooled held-out scores of the random forest feature ablation (run `ablation`), every
+input configuration with its 5x5 window statistics and on the run's common support.
+The columns are grouped by the pixels they are computed over: IoU, AUC and precision
+over all scope pixels, recall over glacier pixels only, and the edge false-positive
+rate over the non-glacier pixels within 30 m outside the outlines. Every row also
+gives its number of input layers. The rows are grouped by input: GLACE and the subsets
+of its layers, the single-pass composites, and the global seasonal product. Two
+variants: with the edge false-positive rate, and with the recall split into clean and
+debris-covered ice instead. Each is printed as a booktabs `tabular` in the layout of
+`tab:rf` in the paper and saved in `FIGURE_DIR`. A figure follows the IoU per glacier
+across the debris-covered fraction of its area.
+
+## Metrics
+
+Every scope pixel is classified at the threshold of the fold that held its tile out,
+and the confusion counts are pooled over the folds: TP and FN are glacier pixels
+predicted as glacier and as non-glacier, FP and TN non-glacier pixels predicted as
+glacier and as non-glacier.
+
+| Metric | Pixels | Definition |
+| --- | --- | --- |
+| AUC | all | Area under the ROC curve of the predicted glacier probability |
+| IoU | all | TP / (TP + FP + FN) |
+| Precision | all | TP / (TP + FP) |
+| Recall | glacier | TP / (TP + FN); clean and debris-covered ice split by the SGI debris flag |
+| Edge FPR | non-glacier, 0 < d ≤ 30 m | FP / (FP + TN) |
+
+The edge false-positive rate is the share of non-glacier pixels in the edge band that
+are classified as glacier. The band holds every non-glacier pixel whose signed distance
+$d$ to the outlines of its acquisition year lies in $0 < d \le 30$ m: $d$ is negative
+inside a glacier and positive outside, from a Euclidean distance transform of the
+rasterized outlines with a 1 km halo, so a tile border does not create an edge. The
+band has no glacier pixels, so it measures only how far a model's glacier extent
+spills over the outline:
+
+$$
+\mathrm{FPR}_\mathrm{edge} = \frac{\mathrm{FP}_\mathrm{edge}}{\mathrm{FP}_\mathrm{edge} + \mathrm{TN}_\mathrm{edge}}
+$$
+
+```{python}
+from matplotlib.colors import to_rgba
+import matplotlib.pyplot as plt
+from matplotlib_inline.backend_inline import set_matplotlib_formats
+import numpy as np
+import pandas as pd
+
+from glace_production.config import settings
+from glace_production.plotting import add_grid, set_context, set_style
+from glace_production.validation.config import DatasetConfig, RunConfig
+from glace_production.validation.store import ValidationStore
+
+set_style()
+set_context("paper")
+set_matplotlib_formats("retina")
+```
+
+## Configuration
+
+```{python}
+TABLE_NAME = "rf-ablation"  # saved as {TABLE_NAME}-{variant}.tex in FIGURE_DIR
+FIGURE_DIR = settings.figures_dir / TABLE_NAME  # one folder per notebook
+FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+RUN = "ablation"
+MODEL = "rf"
+
+# Row groups of the table, in order: (heading, {feature set: row label}). The rows of a
+# group with a heading are set under it, indented; a group without one stands alone.
+# Unless the label says otherwise, an input is coherence and backscatter in VV and VH
+# (the global seasonal product has no VH coherence); the caption says so.
+GROUPS = [
+    (
+        "GLACE",
+        {
+            "all_ctx": "All layers",
+            "vv_ctx": "VV only",
+            "vh_ctx": "VH only",
+            "coh_dual_ctx": "Coherence only",
+            "rtc_dual_ctx": "Backscatter only",
+        },
+    ),
+    (
+        "Single-pass composites",
+        {
+            "pass_ctx": "Both as separate inputs",
+            "asc_ctx": "Ascending only",
+            "desc_ctx": "Descending only",
+        },
+    ),
+    ("", {"gs_ctx": "Global seasonal"}),
+]
+SETS = {fs: label for _, rows in GROUPS for fs, label in rows.items()}
+
+# (group_by, group, metric) -> column label; group None is the pooled score
+COLUMNS = {
+    "iou": (("all", None, "iou"), "IoU"),
+    "auc": (("all", None, "auc"), "AUC"),
+    "precision": (("all", None, "precision"), "Precision"),
+    "recall": (("all", None, "recall"), "Recall"),
+    "clean": (("debris", "clean", "recall"), "Clean"),
+    "debris": (("debris", "debris", "recall"), "Debris"),
+    "edge_fpr": (("band", "edge", "fpr"), "Edge FPR"),
+}
+LAYERS = "Layers"  # column of the number of input layers, before the scores
+
+# Variant -> column groups (header, columns); an empty header gets no rule
+VARIANTS = {
+    "edge": [
+        ("", ["layers"]),
+        ("All pixels", ["iou", "auc", "precision"]),
+        ("Glacier", ["recall"]),
+        ("Non-glacier", ["edge_fpr"]),
+    ],
+    "debris": [
+        ("", ["layers"]),
+        ("All pixels", ["iou", "auc", "precision"]),
+        ("Glacier pixels", ["recall", "clean", "debris"]),
+    ],
+}
+```
+
+## Data
+
+```{python}
+store = ValidationStore.default()
+metrics = store.read_parquet(store.metrics_path(RUN))
+metrics = metrics[(metrics.model == MODEL) & metrics.feature_set.isin(SETS)]
+
+
+def column(group_by: str, group: str | None, metric: str) -> pd.Series:
+    """One score per feature set."""
+    rows = metrics[(metrics.group_by == group_by) & (metrics.metric == metric)]
+    if group is not None:
+        rows = rows[rows.group == group]
+    return rows.set_index("feature_set")["value"]
+
+
+scores = pd.DataFrame({key: column(*spec) for key, (spec, _) in COLUMNS.items()}).reindex(
+    list(SETS)
+)
+```
+
+The number of input layers of a feature set is read from the configs the run and its
+datasets were stamped with: the columns that are measurement layers, without their
+window statistics (each layer enters as its value, 5x5 mean and 5x5 standard
+deviation).
+
+```{python}
+run = RunConfig.from_yaml(store.run_dir(RUN) / "config.yaml")
+layer_names = {
+    name
+    for dataset in run.datasets
+    for name in DatasetConfig.from_yaml(
+        store.samples_dir(dataset) / "config.yaml"
+    ).measurement_layers
+}
+scores["layers"] = pd.Series(
+    {fs: sum(c in layer_names for c in run.feature_sets[fs]) for fs in SETS}
+).reindex(list(SETS))
+scores.rename(index=SETS).round(3)
+```
+
+## LaTeX
+
+No value is set in bold: the rows differ in their number of input layers, so the
+best value of a column does not rank comparable inputs. The table is written line by
+line, indented as in the paper's `main.tex`, so that it replaces the `tabular` there
+unchanged: a `\multicolumn` header over each titled column group with a `\cmidrule`
+below it, a heading row above each titled row group, its rows indented by `\quad`, and
+an `\addlinespace` between the row groups.
+
+```{python}
+INDENT = "    "  # of every line, as in main.tex
+
+
+def booktabs(groups: list[tuple[str, list[str]]]) -> str:
+    """Booktabs tabular of the given column groups, with the rows grouped as in GROUPS."""
+    keys = [k for _, cols in groups for k in cols]
+    n_cols = 1 + len(keys)
+    titles, rules, first = [""], [], 2
+    for title, cols in groups:
+        if title:
+            titles.append(
+                rf"\multicolumn{{{len(cols)}}}{{c}}{{{title}}}" if len(cols) > 1 else title
+            )
+            rules.append(rf"\cmidrule(lr){{{first}-{first + len(cols) - 1}}}")
+        else:
+            titles += [""] * len(cols)
+        first += len(cols)
+    names = ["Input"] + [LAYERS if k == "layers" else COLUMNS[k][1] for k in keys]
+
+    def cell(fs: str, k: str) -> str:
+        value = scores.loc[fs, k]
+        if pd.isna(value):
+            return "--"
+        return f"{value:.0f}" if k == "layers" else f"{value:.3f}"
+
+    lines = [
+        rf"\begin{{tabular}}{{l{'c' * len(keys)}}}",
+        r"\toprule",
+        " & ".join(titles) + r" \\",
+        "".join(rules),
+        " & ".join(names) + r" \\",
+        r"\midrule",
+    ]
+    for i, (heading, rows) in enumerate(GROUPS):
+        if i:
+            lines.append(r"\addlinespace")
+        if heading:
+            lines.append(rf"\multicolumn{{{n_cols}}}{{l}}{{{heading}}} \\")
+        for fs, label in rows.items():
+            row = (r"\quad " if heading else "") + label
+            lines.append(" & ".join([row] + [cell(fs, k) for k in keys]) + r" \\")
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    return "\n".join(INDENT + line for line in lines)
+
+
+for variant, groups in VARIANTS.items():
+    latex = booktabs(groups)
+    (FIGURE_DIR / f"{TABLE_NAME}-{variant}.tex").write_text(latex + "\n")
+    print(f"% variant: {variant}\n{latex}\n")
+```
+
+## Accuracy versus debris cover
+
+The glaciers are binned by the debris-covered fraction of their area (SGI2023 debris
+flag). Every statistic weights a glacier by its glacier pixels, so a bin's mean IoU is
+the area-weighted mean over its glaciers and its percentiles are area-weighted too.
+Weighting by scope pixels instead (glacier pixels plus the non-glacier pixels within
+250 m) would give the smallest glaciers far more weight than their ice: their 250 m
+surroundings are many times their own area, and their IoU is low, as a one-pixel
+outline error is a large share of a few hundred pixels.
+Glaciers straddling two cross-validation folds are left out, since two models predict
+them. The bins are chosen so that each holds a similar number of glacier pixels;
+glaciers without any debris are too few to stand alone and share the lowest bin. Only
+three inputs are drawn, GLACE with coherence only, backscatter only and both, as the
+figure is about how much each measurement loses on debris-covered ice; the other
+inputs are in the table.
+
+```{python}
+DEBRIS_FIGURE = f"{TABLE_NAME}-debris-cover"  # saved as {DEBRIS_FIGURE}.pdf in FIGURE_DIR
+# Feature set -> (label, colour), left to right in each bin. All are GLACE, which the
+# caption says, so the labels are the table's GLACE row labels, except for all_ctx: the
+# table's "All layers" is read against its Layers column, which the figure lacks, so the
+# figure names what the two others are subsets of. Coherence and backscatter take the
+# colours of separability-overview.qmd, their combination a dark grey.
+DEBRIS_SETS = {
+    "all_ctx": ("Coherence + backscatter", "0.25"),
+    "coh_dual_ctx": (SETS["coh_dual_ctx"], "#a49"),
+    "rtc_dual_ctx": (SETS["rtc_dual_ctx"], "#4a9"),
+}
+DEBRIS_EDGES = [0.0, 0.05, 0.10, 0.20, np.inf]  # right-open, so the last takes 100 %
+DEBRIS_LABELS = ["0–5", "5–10", "10–20", "> 20"]  # the unit is in the axis label
+QUANTILES = {"q10": 0.10, "q25": 0.25, "q50": 0.50, "q75": 0.75, "q90": 0.90}
+DODGE = 0.45  # width across which a bin's boxes are spread, in bins
+BOX_ALPHA = 0.35  # of the box fill; the outline stays opaque
+GRID_WIDTH = 0.4  # of the horizontal gridlines, as in separability-overview.qmd
+LABEL_BIN = 0  # the bin whose columns carry the set labels, below their lowest whisker
+LABEL_PAD = 0.02  # between a whisker's end and its label, in IoU
+
+MM = 1 / 25.4
+FIG_WIDTH = 120.0  # mm, 1.5 columns
+FIG_HEIGHT = 70.0  # mm
+
+
+def weighted_quantile(values: np.ndarray, weights: np.ndarray, q: float) -> float:
+    """Quantile of ``values`` with each value counted by its weight (midpoint rule)."""
+    order = np.argsort(values)
+    v, w = values[order], weights[order]
+    cdf = (np.cumsum(w) - 0.5 * w) / w.sum()
+    return float(np.interp(q, cdf, v))
+
+
+def bin_stats(d: pd.DataFrame) -> pd.Series:
+    """Glacier-pixel-weighted mean and percentiles of the IoU of one bin's glaciers."""
+    iou, n = d["iou"].to_numpy(), d["glacier_pixels"].to_numpy()
+    stats = {"iou": np.average(iou, weights=n)}
+    stats |= {k: weighted_quantile(iou, n, q) for k, q in QUANTILES.items()}
+    return pd.Series(stats)
+
+
+glaciers = store.read_parquet(store.glaciers_path(RUN))
+glaciers = glaciers[
+    (glaciers.model == MODEL) & glaciers.feature_set.isin(DEBRIS_SETS) & ~glaciers.straddles_fold
+]
+per_glacier = glaciers.pivot_table(
+    index=["feature_set", "gid", "debris_fraction", "n"], columns="metric", values="value"
+).reset_index()
+per_glacier["glacier_pixels"] = per_glacier["n"] * per_glacier["prevalence"]
+per_glacier["bin"] = pd.cut(
+    per_glacier["debris_fraction"], DEBRIS_EDGES, labels=DEBRIS_LABELS, right=False
+)
+debris = (
+    per_glacier.groupby(["feature_set", "bin"], observed=False)
+    .apply(bin_stats, include_groups=False)
+    .reset_index()
+)
+```
+
+### Bin sizes
+
+Glaciers, scope pixels and glacier pixels per bin (the same for every feature set),
+in thousands of pixels.
+
+```{python}
+first = per_glacier[per_glacier["feature_set"] == next(iter(DEBRIS_SETS))]
+sizes = first.groupby("bin", observed=False).agg(
+    glaciers=("gid", "size"),
+    scope_pixels_k=("n", "sum"),
+    glacier_pixels_k=("glacier_pixels", "sum"),
+)
+sizes[["scope_pixels_k", "glacier_pixels_k"]] = (
+    sizes[["scope_pixels_k", "glacier_pixels_k"]] / 1e3
+).round()
+sizes["glacier_pixel_share"] = (sizes["glacier_pixels_k"] / sizes["glacier_pixels_k"].sum()).round(
+    3
+)
+sizes.astype({"scope_pixels_k": int, "glacier_pixels_k": int})
+```
+
+### Figure
+
+Boxes span the 25th to the 75th percentile, the line is the median, the dot the mean
+and the whiskers reach from the 10th to the 90th percentile. The whiskers are not
+Tukey's 1.5 × IQR, whose outliers would be single glaciers and so ignore the
+weighting; no outliers are drawn. Each input is labelled below its lowest whisker in
+the first bin instead of in a legend.
+
+```{python}
+fig, ax = plt.subplots(figsize=(FIG_WIDTH * MM, FIG_HEIGHT * MM), layout="constrained")
+k = len(DEBRIS_SETS)
+offsets = (np.arange(k) - (k - 1) / 2) * DODGE / k
+bins = np.arange(len(DEBRIS_LABELS))
+for offset, (fs, (label, color)) in zip(offsets, DEBRIS_SETS.items()):
+    part = debris[debris["feature_set"] == fs].set_index("bin").reindex(DEBRIS_LABELS)
+    stats = [
+        {"med": r.q50, "q1": r.q25, "q3": r.q75, "whislo": r.q10, "whishi": r.q90, "mean": r.iou}
+        for r in part.itertuples()
+    ]
+    ax.bxp(
+        stats,
+        positions=bins + offset,
+        widths=0.8 * DODGE / k,
+        showfliers=False,
+        showmeans=True,
+        patch_artist=True,
+        manage_ticks=False,
+        boxprops={"facecolor": to_rgba(color, BOX_ALPHA), "edgecolor": color, "linewidth": 0.8},
+        medianprops={"color": color, "linewidth": 1.2},
+        whiskerprops={"color": color, "linewidth": 0.8},
+        capprops={"color": color, "linewidth": 0.8},
+        meanprops={
+            "marker": "o",
+            "markersize": 2.5,
+            "markerfacecolor": color,
+            "markeredgecolor": "white",
+            "markeredgewidth": 0.4,
+        },
+    )
+    # The input's label hangs vertically below its lower whisker in the label bin
+    ax.text(
+        LABEL_BIN + offset,
+        part["q10"].iloc[LABEL_BIN] - LABEL_PAD,
+        label,
+        rotation=90,
+        ha="center",
+        va="top",
+        color=color,
+        fontweight="bold",
+    )
+ax.set_xticks(bins, DEBRIS_LABELS)
+ax.set_xlim(-0.5, len(DEBRIS_LABELS) - 0.5)
+ax.set_ylim(0, 1)
+add_grid(ax, axis="y", linewidth=GRID_WIDTH)
+ax.set_xlabel("Debris cover (% of glacier area)")
+ax.set_ylabel("IoU per glacier")
+with (FIGURE_DIR / f"{DEBRIS_FIGURE}.pdf").open("wb") as f:
+    fig.savefig(f, format="pdf")
+```
+
+```{python}
+debris.pivot(index="feature_set", columns="bin", values="iou").reindex(list(DEBRIS_SETS)).round(3)
+```

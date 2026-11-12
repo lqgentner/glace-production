@@ -1,0 +1,59 @@
+name: CI
+
+# Lint, type-check and test the default pixi environment. The environment is
+# the one described by pixi.lock (setup-pixi installs with --locked whenever a
+# lock file is present), so a manifest change that was not re-locked fails here
+# rather than in a container build.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Each of the three jobs installs the environment separately, so that lint, type
+# and test failures show up as independent status checks; `cache: true` keys the
+# solved environment on pixi.lock, which makes every run after the first cheap.
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          pixi-version: v0.82.1
+          cache: true
+      - name: Ruff lint
+        run: pixi run lint
+      - name: Ruff format check
+        run: pixi run format-check
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          pixi-version: v0.82.1
+          cache: true
+      - name: Pyrefly
+        run: pixi run typecheck
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          pixi-version: v0.82.1
+          cache: true
+      # No .env is needed: the activation script skips it when absent, and
+      # tests/conftest.py sets placeholder GLACIERS_* variables so that
+      # glace_production.config imports without a configured data store. The
+      # suite touches neither S3 nor Earth Engine.
+      - name: Pytest
+        run: pixi run test

@@ -1,0 +1,232 @@
+---
+title: "Spatial resolution"
+format:
+  html:
+    embed-resources: true
+jupyter: python3
+---
+
+The nominal spatial resolution of the GLACE backscatter (RTC, multilooked $5 \times 1$)
+and coherence ($35 \times 7$ window, no multilooking), on flat terrain, in ground range
+and azimuth. Resolution is the −3 dB width of the impulse response. The processing
+constants come from the annotation of one Sentinel-1 IW SLC burst per sub-swath and are
+taken to be the same for every acquisition: the bandwidths, windows and sampling of the
+IW mode are fixed, and the narrow orbital tube keeps the incidence angles of a sub-swath
+the same from pass to pass. The table is saved as a CSV in `REPORT_DIR`.
+
+The calculation has four steps. Steps 1, 2 and 4 are textbook relations, step 3 is the
+argument made here.
+
+1. **Single-look slant range (Moreira et al., 2013, Sect. II).** A range bandwidth
+   $B_r$ gives $\delta_r = c / (2 B_r)$; weighted by a window, $\delta_r = k_r \, c /
+   (2 B_r)$.
+2. **Single-look azimuth (De Zan and Monti Guarnieri, 2006, Eq. 9).** The TOPS azimuth
+   bandwidth focused for each target, $B_a$, gives $\delta_a = k_a \, v / B_a$, where
+   $k_a$ is the window factor. The paper's rectilinear geometry does not distinguish
+   the sensor's velocity from the ground's. Here $v$ is the ground velocity
+   $v_g = \Delta_a / \Delta t$, the azimuth pixel spacing over the azimuth time
+   interval, so that a resolution in time $k_a / B_a$ maps onto the image's azimuth
+   axis.
+3. **Averaging.** Averaging $N$ neighbouring pixels of spacing $\Delta$ convolves the
+   impulse response with a box of width $N \Delta$. When the impulse response is
+   narrower than the box, the convolution reaches half its maximum at the box edges, so
+   the −3 dB width is the box width. Hence $\delta = \max(\delta_1, N \Delta)$, with
+   $\delta_1$ the single-look resolution.
+4. **Ground range (Meyer, 2019, Eq. 2.3).** On flat terrain at incidence angle
+   $\theta$, a slant-range resolution projects to $\delta_g = \delta_r / \sin\theta$.
+
+The window factor $k$ ("a correction factor, close to one, that depends on the window",
+De Zan and Monti Guarnieri, 2006) is computed here. It is the −3 dB width, in units of
+$1/B$, of the impulse response of a generalized Hamming window
+$w(f) = \alpha + (1 - \alpha) \cos(2 \pi f / B)$ over $|f| \le B/2$. Its inverse
+Fourier transform is
+$h(u) = \alpha \operatorname{sinc}(u) + \tfrac{1 - \alpha}{2}
+\left[\operatorname{sinc}(u - 1) + \operatorname{sinc}(u + 1)\right]$ with $u = B t$
+and the normalized $\operatorname{sinc}(u) = \sin(\pi u) / (\pi u)$; $k$ is twice the
+$u$ at which $h(u)^2 = h(0)^2 / 2$. An unweighted window ($\alpha = 1$) gives the
+familiar $k = 0.886$.
+
+The resolution is that of the radar-geometry image, before geocoding. The geocoding to
+the 10 m output grid interpolates bilinearly between neighbouring pixels of that image,
+which widens the response by up to one of its pixels, depending on where a target falls
+between them. For the RTC this is the multilooked pixel (11.6 m in slant range, 13.9 m
+in azimuth), a sizeable widening; for the coherence it is the single-look pixel, small
+against the $35 \times 7$ window.
+
+```{python}
+from pathlib import Path
+import xml.etree.ElementTree as ET
+import zipfile
+
+import numpy as np
+import pandas as pd
+from scipy import optimize
+import yaml
+
+from glace_production.config import settings
+from data_paths import LRW_CONFIG, run_dirs
+```
+
+## Configuration
+
+One burst per sub-swath from relative orbit 15 (ascending), 4 July 2025, copied from the
+object store to the local mirror. The multilook factors and the coherence window come
+from the run configuration, as (range, azimuth) pixels.
+
+```{python}
+NAME = "spatial-resolution"  # saved as {NAME}.csv in REPORT_DIR
+REPORT_DIR = settings.reports_dir / NAME  # one folder per notebook
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+SLC_DIR = run_dirs(2025).slc_dir
+SLCS = {
+    "IW1": "S1_SLC_015A_030331_IW1_VV_20250704.zip",
+    "IW2": "S1_SLC_015A_030338_IW2_VV_20250704.zip",
+    "IW3": "S1_SLC_015A_030337_IW3_VV_20250704.zip",
+}
+C = 299_792_458.0  # speed of light, m/s
+
+run_config = yaml.safe_load(LRW_CONFIG.read_text())
+WINDOWS = {
+    "SLC": (1, 1),
+    "RTC": tuple(run_config["backscatter"]["multilook"]),
+    "Coherence": tuple(run_config["coherence"]["window"]),
+}
+WINDOWS
+```
+
+## Constants from the SLC annotation
+
+```{python}
+def read_annotation(path: Path) -> ET.Element:
+    """Return the product annotation of a burst SLC zip."""
+    with path.open("rb") as f, zipfile.ZipFile(f) as z:
+        (name,) = [
+            n for n in z.namelist() if n.split("/")[-2:-1] == ["annotation"] and n.endswith(".xml")
+        ]
+        return ET.fromstring(z.read(name))
+
+
+def constants(root: ET.Element) -> dict[str, float]:
+    """Return the processing constants and incidence-angle range of an annotation."""
+
+    def value(path: str) -> float:
+        return float(root.findtext(path))
+
+    incidence = [float(e.text) for e in root.iterfind(".//geolocationGridPoint/incidenceAngle")]
+    return {
+        "range_bandwidth_hz": value(".//rangeProcessing/processingBandwidth"),
+        "range_window": value(".//rangeProcessing/windowCoefficient"),
+        "azimuth_bandwidth_hz": value(".//azimuthProcessing/processingBandwidth"),
+        "azimuth_window": value(".//azimuthProcessing/windowCoefficient"),
+        "range_spacing_m": value(".//imageInformation/rangePixelSpacing"),
+        "azimuth_spacing_m": value(".//imageInformation/azimuthPixelSpacing"),
+        "azimuth_time_interval_s": value(".//imageInformation/azimuthTimeInterval"),
+        "incidence_near_deg": min(incidence),
+        "incidence_far_deg": max(incidence),
+    }
+
+
+annotations = pd.DataFrame(
+    {swath: constants(read_annotation(SLC_DIR / name)) for swath, name in SLCS.items()}
+).T
+annotations.T
+```
+
+Both windows are Hamming windows; the annotation gives their coefficient $\alpha$.
+
+```{python}
+def window_factor(alpha: float) -> float:
+    """Return the -3 dB width, in units of 1/B, of a generalized Hamming window."""
+
+    def h(u: float) -> float:
+        return alpha * np.sinc(u) + (1 - alpha) / 2 * (np.sinc(u - 1) + np.sinc(u + 1))
+
+    u_half = optimize.brentq(lambda u: h(u) ** 2 - h(0) ** 2 / 2, 0, 1)
+    return 2 * u_half
+
+
+{alpha: round(window_factor(alpha), 3) for alpha in (1.0, 0.75, 0.70)}
+```
+
+## Single-look resolution
+
+```{python}
+a = annotations
+single_look = pd.DataFrame(
+    {
+        "slant_range_m": a["range_window"].map(window_factor) * C / (2 * a["range_bandwidth_hz"]),
+        "ground_velocity_m_s": a["azimuth_spacing_m"] / a["azimuth_time_interval_s"],
+    }
+)
+single_look["azimuth_m"] = (
+    a["azimuth_window"].map(window_factor)
+    * single_look["ground_velocity_m_s"]
+    / a["azimuth_bandwidth_hz"]
+)
+single_look.round(2)
+```
+
+As a check, the Sentinel-1 User Handbook (ESA, 2013, Table 1) gives the IW SLC
+resolution as 2.7 × 22 m to 3.5 × 22 m (slant range × azimuth), from the lowest to the
+highest incidence angle.
+
+## Resolution of the products
+
+Ground range at the near and far edge of each sub-swath, azimuth over the sub-swath.
+
+```{python}
+rows = []
+for product, (n_range, n_azimuth) in WINDOWS.items():
+    for swath in SLCS:
+        slant = max(
+            single_look.at[swath, "slant_range_m"], n_range * a.at[swath, "range_spacing_m"]
+        )
+        azimuth = max(
+            single_look.at[swath, "azimuth_m"], n_azimuth * a.at[swath, "azimuth_spacing_m"]
+        )
+        near, far = np.radians(a.loc[swath, ["incidence_near_deg", "incidence_far_deg"]])
+        rows.append(
+            {
+                "product": product,
+                "swath": swath,
+                "window": f"{n_range}x{n_azimuth}",
+                "slant_range_m": slant,
+                "ground_range_near_m": slant / np.sin(near),
+                "ground_range_far_m": slant / np.sin(far),
+                "azimuth_m": azimuth,
+            }
+        )
+table = pd.DataFrame(rows).set_index(["product", "swath"])
+table.to_csv(REPORT_DIR / f"{NAME}.csv", float_format="%.1f")
+table.round(1)
+```
+
+## For the paper
+
+Ground range from its smallest to its largest value over the three sub-swaths; azimuth
+as the mean over the sub-swaths, which differ by less than a metre.
+
+```{python}
+table.groupby("product", sort=False).agg(
+    window=("window", "first"),
+    ground_range_min_m=("ground_range_far_m", "min"),
+    ground_range_max_m=("ground_range_near_m", "max"),
+    azimuth_m=("azimuth_m", "mean"),
+).round(0)
+```
+
+## References
+
+- De Zan, F., and Monti Guarnieri, A. (2006). TOPSAR: Terrain observation by progressive
+  scans. *IEEE Transactions on Geoscience and Remote Sensing*, 44(9), 2352–2360.
+  <https://doi.org/10.1109/TGRS.2006.873853>
+- ESA (2013). *Sentinel-1 User Handbook*, issue 1, revision 0. European Space Agency.
+- Meyer, F. (2019). Spaceborne synthetic aperture radar: principles, data access, and
+  basic processing techniques. In A. Flores-Anderson, K. Herndon, R. Thapa, and
+  E. Cherrington (Eds.), *The SAR Handbook: Comprehensive Methodologies for Forest
+  Monitoring and Biomass Estimation*, chapter 2. NASA SERVIR.
+  <https://doi.org/10.25966/nr2c-s697>
+- Moreira, A., Prats-Iraola, P., Younis, M., Krieger, G., Hajnsek, I., and Papathanassiou,
+  K. P. (2013). A tutorial on synthetic aperture radar. *IEEE Geoscience and Remote
+  Sensing Magazine*, 1(1), 6–43. <https://doi.org/10.1109/MGRS.2013.2248301>

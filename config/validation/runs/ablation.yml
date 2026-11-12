@@ -1,0 +1,130 @@
+# Feature ablation of the random forest. Every set carries the 5x5 window mean
+# and standard deviation of its channels (`_ctx`); `all_ctx` is the base model.
+# The merged GLACE composites, the per-pass composites and the global seasonal
+# product are in one run, so every set is scored on the same support: the
+# intersection of the ascending and descending coverage with the other two.
+name: ablation
+datasets: [lrw-alps, pass-alps, globalseasonal-ch]
+folds: config/validation/folds-ch.csv
+feature_sets:
+  # GLACE coherence, VV + VH
+  coh_dual_ctx:
+    - coh_vv
+    - coh_vh
+    - coh_vv_mean5
+    - coh_vv_std5
+    - coh_vh_mean5
+    - coh_vh_std5
+  # GLACE backscatter, VV + VH
+  rtc_dual_ctx:
+    - rtc_vv
+    - rtc_vh
+    - rtc_vv_mean5
+    - rtc_vv_std5
+    - rtc_vh_mean5
+    - rtc_vh_std5
+  # GLACE coherence + backscatter, VV + VH: the base model
+  all_ctx:
+    - rtc_vv
+    - rtc_vh
+    - coh_vv
+    - coh_vh
+    - rtc_vv_mean5
+    - rtc_vv_std5
+    - rtc_vh_mean5
+    - rtc_vh_std5
+    - coh_vv_mean5
+    - coh_vv_std5
+    - coh_vh_mean5
+    - coh_vh_std5
+  # GLACE coherence + backscatter, VV only
+  vv_ctx:
+    - rtc_vv
+    - coh_vv
+    - rtc_vv_mean5
+    - rtc_vv_std5
+    - coh_vv_mean5
+    - coh_vv_std5
+  # GLACE coherence + backscatter, VH only
+  vh_ctx:
+    - rtc_vh
+    - coh_vh
+    - rtc_vh_mean5
+    - rtc_vh_std5
+    - coh_vh_mean5
+    - coh_vh_std5
+  # Ascending and descending composites as separate channels, VV + VH
+  pass_ctx:
+    - rtc_vv_a
+    - rtc_vh_a
+    - coh_vv_a
+    - coh_vh_a
+    - rtc_vv_a_mean5
+    - rtc_vv_a_std5
+    - rtc_vh_a_mean5
+    - rtc_vh_a_std5
+    - coh_vv_a_mean5
+    - coh_vv_a_std5
+    - coh_vh_a_mean5
+    - coh_vh_a_std5
+    - rtc_vv_d
+    - rtc_vh_d
+    - coh_vv_d
+    - coh_vh_d
+    - rtc_vv_d_mean5
+    - rtc_vv_d_std5
+    - rtc_vh_d_mean5
+    - rtc_vh_d_std5
+    - coh_vv_d_mean5
+    - coh_vv_d_std5
+    - coh_vh_d_mean5
+    - coh_vh_d_std5
+  # Ascending composites only, VV + VH: as many layers as GLACE
+  asc_ctx:
+    - rtc_vv_a
+    - rtc_vh_a
+    - coh_vv_a
+    - coh_vh_a
+    - rtc_vv_a_mean5
+    - rtc_vv_a_std5
+    - rtc_vh_a_mean5
+    - rtc_vh_a_std5
+    - coh_vv_a_mean5
+    - coh_vv_a_std5
+    - coh_vh_a_mean5
+    - coh_vh_a_std5
+  # Descending composites only, VV + VH: as many layers as GLACE
+  desc_ctx:
+    - rtc_vv_d
+    - rtc_vh_d
+    - coh_vv_d
+    - coh_vh_d
+    - rtc_vv_d_mean5
+    - rtc_vv_d_std5
+    - rtc_vh_d_mean5
+    - rtc_vh_d_std5
+    - coh_vv_d_mean5
+    - coh_vv_d_std5
+    - coh_vh_d_mean5
+    - coh_vh_d_std5
+  # Global seasonal coherence (VV) + backscatter (VV + VH); it has no VH coherence
+  gs_ctx:
+    - gs_bs_vv
+    - gs_bs_vh
+    - gs_coh_vv
+    - gs_bs_vv_mean5
+    - gs_bs_vv_std5
+    - gs_bs_vh_mean5
+    - gs_bs_vh_std5
+    - gs_coh_vv_mean5
+    - gs_coh_vv_std5
+models: [rf]
+# Learning curve (2026-10-19, `--learning-curve --feature-set NAME`): RF fit on folds 2-4,
+# scored on every support row of fold 1 (glacier + 250 m), AUC at 100k / 300k / 1M / 2M rows:
+#   all_ctx  0.9657 / 0.9666 / 0.9673 / 0.9675
+#   pass_ctx 0.9663 / 0.9680 / 0.9696 / 0.9704
+# 1M is within 0.001 of 2M for both (300k is not for pass_ctx, the largest set).
+train_rows: 1000000
+n_seeds: 1
+seed: 0
+save_models: false

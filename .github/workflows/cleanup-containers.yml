@@ -1,0 +1,19 @@
+name: Clean up container images
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * 0'
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          package: glace-production
+          keep-n-tagged: 10
+          delete-untagged: true
+          delete-partial-images: true

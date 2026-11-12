@@ -1,0 +1,341 @@
+---
+title: "RF inputs and classification error maps"
+format:
+  html:
+    embed-resources: true
+jupyter: python3
+---
+
+VV backscatter, VV coherence and the random forest's classified map for three
+glacier regions. The prediction is compared against the SGI2023 year-split
+label mask: agreement and both error kinds, plus the pixels excluded from the
+validation (label ignore or no valid prediction). Every region shares one
+window size, so the three rows are at the same scale. The inputs are the GLACE
+composites of the Alps-wide run (`alps-total/{year}/s1-comp`), mosaicked from
+the tiles under the window; labels and maps are read from their mosaic VRTs, so a
+window may span several MGRS tiles. The maps carry no coordinates: the caption gives each window's centre, printed below. Each row
+is one panel, lettered like the windows on the dataset overview's map.
+
+```{python}
+from string import ascii_lowercase
+
+import cmcrameri.cm as cmc
+from matplotlib.colors import BoundaryNorm, ListedColormap
+from matplotlib.font_manager import FontProperties
+from matplotlib.patches import Patch
+import matplotlib.pyplot as plt
+from matplotlib.textpath import TextPath
+from matplotlib_inline.backend_inline import set_matplotlib_formats
+import numpy as np
+from pyproj import CRS, Transformer
+from rasterio.windows import from_bounds
+
+from freezebase.raster import rasterio_open
+
+from glace_production.composites import default_config_dir
+from glace_production.config import settings
+from glace_production.plotting import add_scalebar, set_context, set_style
+from glace_production.validation.config import LocationsConfig
+from glace_production.validation.store import ValidationStore
+
+set_style()
+set_context("paper")
+set_matplotlib_formats("retina")
+```
+
+## Configuration
+
+The regions come from `regions.py` beside this notebook, which the dataset overview
+also reads to mark them on the Alps-wide map. Each is selected by the lower-left
+corner of its window (UTM 32N, metres, on the 10 m grid); `WIDTH_M` and `HEIGHT_M`
+apply to all of them.
+
+```{python}
+from data_paths import run_dirs
+from regions import REGION_EPSG, REGIONS, region_bounds
+from tiles import read_window as read_tiles, tile_file, window_tiles
+
+FIGURE_NAME = "mapping-examples"  # saved as {FIGURE_NAME}.pdf in FIGURE_DIR
+FIGURE_DIR = settings.figures_dir / FIGURE_NAME  # one folder per notebook
+FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+RUN = "ablation"
+FEATURE_SET = "all_ctx"
+MODEL = "rf"
+
+# The 2-98 % range over the windows, rounded; the percentiles are printed to compare
+# against. The dataset overview has its own, narrower stretch.
+STRETCH_PERCENTILES = (2, 98)
+RTC_VMIN, RTC_VMAX = -16, -3
+RTC_CMAP = cmc.navia
+COH_VMIN, COH_VMAX = 0.0, 0.8
+COH_CMAP = cmc.lipari
+
+# CIELAB lightness 100 / 88 / 73 / 59 / 40, so the classes stay apart in greyscale;
+# the errors' chroma (30 / 40) stays near the glacier blue's (25)
+CLASSES = {
+    "Glacier": "#8EB7E0",
+    "False glacier": "#8D4A53",
+    "False non-glacier": "#C37D55",
+    "Non-glacier": "#DDDDDD",
+    "Excluded": "#FFFFFF",
+}
+LEGEND_ROWS = [
+    ["Glacier", "False glacier"],
+    ["False non-glacier", "Non-glacier"],
+    ["Excluded"],
+]
+
+TITLES = ["GLACE Backscatter", "GLACE Coherence", "Random Forest Error Map"]
+# Row labels shorter than the inventory names in regions.py, which the caption spells out
+ROW_NAMES = {"Grosser Aletschgletscher": "Gr. Aletschgletscher"}
+RTC_LABEL = "VV backscatter (dB)"
+COH_LABEL = "VV coherence"
+# Whole multiples of 4 dB, the high end unlabelled
+RTC_TICKS = np.arange(RTC_VMIN, RTC_VMAX + 1e-6, 4)
+COH_TICKS = np.arange(COH_VMIN, COH_VMAX + 1e-6, 0.2)
+
+# Layout in mm. The square panels fill the width and the figure height follows from
+# them; Nature's maximum is 180 mm x 215 mm.
+MM = 1 / 25.4  # inches per mm
+FIG_WIDTH = 180
+GAP = 4.5  # between the panels, and between the maps and the colorbars and legend
+MARGIN_LEFT = 5.5  # row labels
+MARGIN_RIGHT = 1.0
+MARGIN_TOP = 5.5  # column titles
+MARGIN_BOTTOM = 12.5  # below the colorbars' and legend's top edge: fits the class legend
+SCALEBAR_FONTSIZE = 7  # pt, one step below the body text: an annotation on the map
+# Colorbars and scalebars as in lrw-effect.qmd, relative to the panel width: the
+# extend triangles (5 % of the bar each) stay inside the panel
+COLORBAR_WIDTH = 0.90  # fraction of the panel width, centred below it
+COLORBAR_ASPECT = 20  # colorbar length over thickness, as matplotlib's `aspect`
+```
+
+```{python}
+MAPS_DIR = ValidationStore.default().maps_dir(RUN, FEATURE_SET, MODEL)
+LABELS_DIR = settings.resolve_data_path(
+    LocationsConfig.from_yaml(default_config_dir() / "validation" / "locations-ch.yml").labels_dir
+)
+LABEL_IGNORE = 255
+MAP_NODATA = 255
+MAP_CRS = CRS.from_epsg(REGION_EPSG)
+
+
+COMPOSITES = {"rtc": "S1_RTC_LRW_{tile}_VV_*.tif", "coh": "S1_COH12_LRW_{tile}_VV_*.tif"}
+
+
+def paths(year: int) -> dict[str, object]:
+    return {
+        "label": LABELS_DIR / f"LABELS_SGI2023_{year}.vrt",
+        "cls": MAPS_DIR / f"CLS_{FEATURE_SET}_{MODEL}_{year}.vrt",
+    }
+
+
+def read_composite(key: str, year: int, bounds: tuple[float, float, float, float]) -> np.ndarray:
+    """Mosaic a VV composite inside ``bounds`` from the tiles under it, nodata as NaN."""
+    comp_dir = run_dirs(year).comp_dir
+    tiles = window_tiles(bounds, REGION_EPSG)
+    return read_tiles(
+        [tile_file(comp_dir, COMPOSITES[key], t) for t in tiles], bounds, REGION_EPSG
+    )
+
+
+def read_window(path, bounds: tuple[float, float, float, float]) -> np.ndarray:
+    """Read band 1 inside ``bounds`` (left, bottom, right, top) from a mosaic VRT."""
+    with rasterio_open(path) as src:
+        if src.crs.to_epsg() != REGION_EPSG:
+            raise ValueError(f"{path}: expected EPSG:{REGION_EPSG}, got {src.crs}")
+        window = from_bounds(*bounds, transform=src.transform).round_offsets().round_lengths()
+        return src.read(1, window=window, boundless=True, fill_value=src.nodata)
+
+
+def extend(values: list[np.ndarray], vmin: float, vmax: float) -> str:
+    """Colorbar ``extend`` for the ends of ``[vmin, vmax]`` the finite values exceed."""
+    low = any(np.nanmin(v) < vmin for v in values)
+    high = any(np.nanmax(v) > vmax for v in values)
+    return {(False, False): "neither", (True, False): "min", (False, True): "max"}.get(
+        (low, high), "both"
+    )
+
+
+def classify(label: np.ndarray, cls: np.ndarray) -> np.ndarray:
+    """Index into ``CLASSES`` for every pixel of a label mask and a classified map."""
+    out = np.full(label.shape, list(CLASSES).index("Excluded"), dtype=np.uint8)
+    valid = (label != LABEL_IGNORE) & (cls != MAP_NODATA)
+    truth, pred = label == 1, cls == 1
+    for name, hit in {
+        "Glacier": truth & pred,
+        "False glacier": ~truth & pred,
+        "Non-glacier": ~truth & ~pred,
+        "False non-glacier": truth & ~pred,
+    }.items():
+        out[valid & hit] = list(CLASSES).index(name)
+    return out
+
+
+panels = []
+for region in REGIONS:
+    bounds = region_bounds(region)
+    p = paths(region["year"])
+    rtc = read_composite("rtc", region["year"], bounds)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rtc_db = np.where(rtc > 0, 10 * np.log10(rtc), np.nan)
+    panels.append(
+        {
+            **region,
+            "bounds": bounds,
+            "rtc": rtc_db,
+            "coh": read_composite("coh", region["year"], bounds),
+            "classes": classify(read_window(p["label"], bounds), read_window(p["cls"], bounds)),
+        }
+    )
+```
+
+The percentiles of the windows, pooled and per region, to check the stretch against:
+
+```{python}
+def stretch(key: str) -> list[np.ndarray]:
+    """``STRETCH_PERCENTILES`` of the finite ``key`` values, pooled first, then per region."""
+    values = [p[key][np.isfinite(p[key])] for p in panels]
+    return [np.percentile(v, STRETCH_PERCENTILES) for v in (np.concatenate(values), *values)]
+
+
+for name, rtc_pct, coh_pct in zip(
+    ["pooled", *(p["name"] for p in panels)], stretch("rtc"), stretch("coh"), strict=True
+):
+    (rtc_lo, rtc_hi), (coh_lo, coh_hi) = rtc_pct.round(1), coh_pct.round(2)
+    print(
+        f"{STRETCH_PERCENTILES} % {name}: backscatter {rtc_lo} to {rtc_hi} dB, coherence {coh_lo} to {coh_hi}"
+    )
+print(f"stretch: backscatter {RTC_VMIN} to {RTC_VMAX} dB, coherence {COH_VMIN} to {COH_VMAX}")
+```
+
+Window centres for the caption, in WGS 84:
+
+```{python}
+to_wgs84 = Transformer.from_crs(MAP_CRS, "EPSG:4326", always_xy=True)
+for panel in panels:
+    left, bottom, right, top = panel["bounds"]
+    lon, lat = to_wgs84.transform((left + right) / 2, (bottom + top) / 2)
+    print(f"{panel['name']}, {panel['year']}: {lat:.4f}° N, {lon:.4f}° E")
+```
+
+## Figure
+
+```{python}
+cls_cmap = ListedColormap(list(CLASSES.values()))
+cls_norm = BoundaryNorm(np.arange(len(CLASSES) + 1) - 0.5, len(CLASSES))
+
+# Every position in mm from the top-left corner. Titles, row labels and colorbar
+# ticks must fit the margins and gaps: nothing moves the panels to make room.
+panel_mm = (FIG_WIDTH - MARGIN_LEFT - MARGIN_RIGHT - 2 * GAP) / 3
+below_maps_mm = MARGIN_TOP + len(panels) * panel_mm + (len(panels) - 1) * GAP + GAP
+fig_height = below_maps_mm + MARGIN_BOTTOM
+print(f"figure {FIG_WIDTH} mm x {fig_height:.1f} mm, panels {panel_mm:.2f} mm")
+
+
+def rect(x: float, y: float, width: float, height: float) -> tuple[float, float, float, float]:
+    """Figure-fraction rectangle of a box at (x, y) mm from the top-left corner."""
+    return (x / FIG_WIDTH, 1 - (y + height) / fig_height, width / FIG_WIDTH, height / fig_height)
+
+
+def column_x(j: int) -> float:
+    return MARGIN_LEFT + j * (panel_mm + GAP)
+
+
+fig = plt.figure(figsize=(FIG_WIDTH * MM, fig_height * MM))
+axs = np.array(
+    [
+        [
+            fig.add_axes(rect(column_x(j), MARGIN_TOP + i * (panel_mm + GAP), panel_mm, panel_mm))
+            for j in range(3)
+        ]
+        for i in range(len(panels))
+    ]
+)
+for row, panel in zip(axs, panels, strict=True):
+    left, bottom, right, top = panel["bounds"]
+    kwargs = {"extent": (left, right, bottom, top), "origin": "upper", "interpolation": "nearest"}
+    rtc_im = row[0].imshow(panel["rtc"], cmap=RTC_CMAP, vmin=RTC_VMIN, vmax=RTC_VMAX, **kwargs)
+    coh_im = row[1].imshow(panel["coh"], cmap=COH_CMAP, vmin=COH_VMIN, vmax=COH_VMAX, **kwargs)
+    row[2].imshow(panel["classes"], cmap=cls_cmap, norm=cls_norm, **kwargs)
+    for ax in row:
+        ax.set(xticks=[], yticks=[])
+        ax.spines[:].set_visible(False)
+    row[0].set_ylabel(
+        f"{ROW_NAMES.get(panel['name'], panel['name'])} ({panel['year']})",
+        fontsize=plt.rcParams["axes.titlesize"],
+        fontweight="bold",
+    )
+
+# Each row's panel letter upright above its name, its cap height flush with the maps' top
+font = FontProperties(size=plt.rcParams["axes.titlesize"], weight="bold")
+cap_height = TextPath((0, 0), "H", prop=font).get_extents().height
+for letter, ax in zip(ascii_lowercase, axs[:, 0], strict=False):
+    ax.annotate(
+        letter,
+        (0.5, 1),
+        xycoords=(ax.yaxis.label, "axes fraction"),
+        xytext=(0, -cap_height),
+        textcoords="offset points",
+        ha="center",
+        va="baseline",
+        fontproperties=font,
+    )
+
+for ax, title in zip(axs[0], TITLES, strict=True):
+    ax.set_title(title, fontweight="bold")
+
+for ax in axs[:, 2]:
+    add_scalebar(
+        ax,
+        style="filled",
+        loc="lower right",
+        crs=MAP_CRS,
+        linewidth=plt.rcParams["axes.linewidth"],
+        prop=FontProperties(size=SCALEBAR_FONTSIZE),
+    )
+
+# Colorbars below the first two columns, the class legend below the third, all with
+# their top edge one gap below the maps
+cbar_width = COLORBAR_WIDTH * panel_mm
+cbar_height = cbar_width / COLORBAR_ASPECT
+rtc_cax, coh_cax = (
+    fig.add_axes(
+        rect(column_x(j) + (panel_mm - cbar_width) / 2, below_maps_mm, cbar_width, cbar_height)
+    )
+    for j in range(2)
+)
+rtc_extend = extend([p["rtc"] for p in panels], RTC_VMIN, RTC_VMAX)
+coh_extend = extend([p["coh"] for p in panels], COH_VMIN, COH_VMAX)
+fig.colorbar(
+    rtc_im,
+    cax=rtc_cax,
+    orientation="horizontal",
+    extend=rtc_extend,
+    label=RTC_LABEL,
+    ticks=RTC_TICKS,
+)
+fig.colorbar(
+    coh_im,
+    cax=coh_cax,
+    orientation="horizontal",
+    extend=coh_extend,
+    label=COH_LABEL,
+    ticks=COH_TICKS,
+)
+# The legend fills column by column, so read LEGEND_ROWS column-wise
+ncols = max(len(r) for r in LEGEND_ROWS)
+order = [r[c] for c in range(ncols) for r in LEGEND_ROWS if c < len(r)]
+handles = [Patch(facecolor=CLASSES[n], edgecolor="0.3", linewidth=0.4, label=n) for n in order]
+legend_anchor = ((column_x(2) + panel_mm / 2) / FIG_WIDTH, 1 - below_maps_mm / fig_height)
+fig.legend(
+    handles=handles,
+    loc="upper center",
+    bbox_to_anchor=legend_anchor,
+    ncols=ncols,
+    columnspacing=0.8,
+    borderaxespad=0,
+)
+with (FIGURE_DIR / f"{FIGURE_NAME}.pdf").open("wb") as f:
+    fig.savefig(f, format="pdf", bbox_inches=None)
+```

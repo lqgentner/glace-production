@@ -1,0 +1,27 @@
+# Fleet job manifest for the per-pass composites of the Alpine glaciers, mean
+# aggregation.
+# Only covers 2021–2024, the years of the validation. Downloads and processes
+# whatever burst products are missing, then composes.
+#
+# Each entry is one VM/container: `name` must be unique (used for the VM name
+# glacier-fleet-<name> and the container name); `script`, `config`, and the
+# optional `args` are passed straight to `python <script> <config> <args>` on the
+# VM. `args` holds OmegaConf dot-notation overrides, which is how the annual runs
+# all share a single config file.
+jobs:
+  - name: alps-pass-2021
+    script: scripts/s1-composites/process-composites.py
+    config: config/pass-alps.yml
+    args: year=2021
+  - name: alps-pass-2022
+    script: scripts/s1-composites/process-composites.py
+    config: config/pass-alps.yml
+    args: year=2022
+  - name: alps-pass-2023
+    script: scripts/s1-composites/process-composites.py
+    config: config/pass-alps.yml
+    args: year=2023
+  - name: alps-pass-2024
+    script: scripts/s1-composites/process-composites.py
+    config: config/pass-alps.yml
+    args: year=2024

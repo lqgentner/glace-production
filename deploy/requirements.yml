@@ -1,0 +1,11 @@
+---
+# Ansible, the OpenStack SDK and the CLI come from the `deploy` environment;
+# the collections below are installed on top of it:
+#   pixi install -e deploy
+#   pixi run -e deploy ansible-galaxy collection install -r deploy/requirements.yml
+
+collections:
+  - name: openstack.cloud
+    version: ">=2.2.0"
+  - name: community.docker
+    version: ">=3.0.0"

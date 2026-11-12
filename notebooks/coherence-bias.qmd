@@ -1,0 +1,200 @@
+---
+title: "Coherence bias over water"
+format:
+  html:
+    embed-resources: true
+jupyter: python3
+---
+
+The coherence of the composites over lake surfaces, as done by Kellndorfer et al. (2022).
+Over a 12-day baseline water decorrelates completely, so its true coherence is zero, and
+the coherence the composite shows there is the bias the finite estimation window leaves.
+The lakes are the `N_LAKES` largest lakes of Natural Earth by their area inside the
+year's tile footprint, so the selection needs no hand-picked boxes. The median and mean
+over the water pixels are reported for each lake and pooled over all lakes; the
+composites' aggregation is read from their tags.
+
+```{python}
+from pathlib import Path
+import warnings
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+from rasterio.features import rasterize
+from rasterio.windows import Window, from_bounds
+from scipy import ndimage
+
+from freezebase.raster import rasterio_open
+
+from glace_production.config import settings
+from glace_production.datasets import NaturalEarthLakes
+from data_paths import run_dirs, run_scope
+from tiles import scope_tiles
+```
+
+## Configuration
+
+`COMP_DIR` is the output directory of a composite run; the tile footprints come from the
+MGRS grid of the `alps-total` scope (`tiles.py` beside this notebook). Water is the set of pixels darker than `DARK_DB` in the VV backscatter
+composite, in connected components of at least `MIN_AREA_KM2` that lie mostly inside the
+lake's Natural Earth polygon; radar shadow is NaN in the composites and cannot pass for
+water. Pixels closer than `SHORE_M` to the edge of their component are dropped, which
+removes mixed shoreline pixels and the land the estimation window reaches into.
+
+```{python}
+# The nominal year of SGI2023, so the floor comes from composites the validation scores.
+YEAR = 2023
+COMP_DIR = run_dirs(YEAR).comp_dir
+N_LAKES = 5
+EQUAL_AREA = "EPSG:3035"  # lake areas are measured on the ETRS89-LAEA grid of the mosaics
+# Natural Earth's 1:10m global layer labels Lake Maggiore (centre 8.65° E, 45.97° N) as
+# "Lago di Como"; the real Lake Como is in the europe supplement. The layers do not overlap.
+NAME_FIXES = {("global", "Lago di Como"): "Lago Maggiore"}
+DARK_DB = -18.0
+MIN_AREA_KM2 = 1.0
+SHORE_M = 100
+PIXEL_M = 10
+POLARIZATIONS = ("vv", "vh")
+
+tiles = scope_tiles(run_scope())
+```
+
+## Lake selection
+
+The global Natural Earth lakes and the europe supplement together, ranked by the area of
+each polygon inside the footprint of the year's tiles.
+
+```{python}
+footprint = tiles.to_crs(EQUAL_AREA).union_all()
+lakes = pd.concat(
+    [
+        NaturalEarthLakes(resolution="10m", supplement=supplement)
+        .get_data()
+        .assign(layer="global" if supplement is None else supplement)
+        for supplement in (None, "europe")
+    ],
+    ignore_index=True,
+).to_crs(EQUAL_AREA)
+for (layer, name), fixed in NAME_FIXES.items():
+    lakes.loc[(lakes["layer"] == layer) & (lakes["name"] == name), "name"] = fixed
+lakes["lake_km2"] = lakes.geometry.area / 1e6
+lakes["inside_km2"] = lakes.geometry.intersection(footprint).area / 1e6
+lakes = lakes.nlargest(N_LAKES, "inside_km2").set_index("name").to_crs(4326)
+lakes[["layer", "lake_km2", "inside_km2"]].round(1)
+```
+
+## Water masks
+
+Each lake is read from every tile its polygon touches, cut to the polygon's bounds.
+
+```{python}
+def composite(product: str, tile: str, pol: str, qa: str = "") -> Path:
+    """Path of one composite layer, e.g. product "COH12", qa "QA-NUM"."""
+    qa = f"{qa}_" if qa else ""
+    (path,) = COMP_DIR.glob(f"S1_{product}_LRW_{qa}{tile}_{pol.upper()}_*.tif")
+    return path
+
+
+def aggregation(path: Path) -> str:
+    with rasterio_open(path) as src:
+        parameters = src.tags()["COMPOSITING_PARAMETERS"]
+    return dict(p.split("=") for p in parameters.split(";"))["aggregation"]
+
+
+def read_window(path: Path, bounds) -> tuple[np.ndarray, object]:
+    """Band 1 inside ``bounds`` and the transform of that window."""
+    with rasterio_open(path) as src:
+        window = (
+            from_bounds(*bounds, transform=src.transform)
+            .round_offsets()
+            .round_lengths()
+            .intersection(Window(0, 0, src.width, src.height))
+        )
+        return src.read(1, window=window), src.window_transform(window)
+
+
+def water_pixels(lake: str, polygon) -> pd.DataFrame:
+    frames = []
+    for tile, epsg in tiles.loc[tiles.intersects(polygon), ["tile", "epsg"]].values:
+        (polygon_tile,) = gpd.GeoSeries([polygon], crs=4326).to_crs(epsg)
+        bounds = polygon_tile.bounds
+        vv, transform = read_window(composite("RTC", tile, "vv"), bounds)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            dark = 10 * np.log10(vv) < DARK_DB
+        labels, n = ndimage.label(dark)
+        index = np.arange(1, n + 1)
+        sizes = ndimage.sum_labels(dark, labels, index)
+        inside = rasterize([polygon_tile], out_shape=dark.shape, transform=transform).astype(bool)
+        inside_share = ndimage.mean(inside, labels, index)
+        min_px = MIN_AREA_KM2 * 1e6 / PIXEL_M**2
+        water = np.isin(labels, index[(sizes >= min_px) & (inside_share > 0.5)])
+        if not water.any():
+            continue
+        shore_m = ndimage.distance_transform_edt(water) * PIXEL_M
+        frame = {"lake": lake, "tile": tile, "shore_m": shore_m[water].astype("f4")}
+        for pol in POLARIZATIONS:
+            coh = composite("COH12", tile, pol)
+            frame[f"aggregation_{pol}"] = aggregation(coh)
+            frame[f"coh_{pol}"] = read_window(coh, bounds)[0][water]
+            pairs = composite("COH12", tile, pol, "QA-NUM")
+            frame[f"pairs_{pol}"] = read_window(pairs, bounds)[0][water]
+        frames.append(pd.DataFrame(frame))
+    return pd.concat(frames, ignore_index=True)
+
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", RuntimeWarning)
+    pixels = pd.concat(
+        [water_pixels(lake, polygon) for lake, polygon in lakes.geometry.items()],
+        ignore_index=True,
+    )
+pixels = pixels.dropna(subset=[f"coh_{pol}" for pol in POLARIZATIONS])
+
+(AGGREGATION,) = set(pixels[[f"aggregation_{pol}" for pol in POLARIZATIONS]].to_numpy().ravel())
+water = pixels[pixels["shore_m"] >= SHORE_M]
+print(f"{len(water):,} water pixels, {AGGREGATION} composite")
+```
+
+## Coherence over water
+
+```{python}
+def summarise(df: pd.DataFrame) -> pd.Series:
+    row = {"area_km2": len(df) * PIXEL_M**2 / 1e6, "pairs": df["pairs_vv"].median()}
+    for pol in POLARIZATIONS:
+        row[f"median_{pol}"] = df[f"coh_{pol}"].median()
+        row[f"mean_{pol}"] = df[f"coh_{pol}"].mean()
+    return pd.Series(row)
+
+
+table = pd.concat(
+    [
+        water.groupby("lake").apply(summarise, include_groups=False),
+        summarise(water).to_frame("pooled").T,
+    ]
+)
+table.round({"area_km2": 1, "pairs": 0} | {c: 3 for c in table if c[-2:] in POLARIZATIONS})
+```
+
+## Numbers for the paper
+
+```{python}
+pooled = table.loc["pooled"]
+per_lake = table.drop(index="pooled")
+for pol in POLARIZATIONS:
+    col = f"median_{pol}"
+    print(
+        f"{pol.upper()}: median coherence over water {pooled[col]:.3f} "
+        f"(lakes {per_lake[col].min():.3f}-{per_lake[col].max():.3f}), mean {pooled[f'mean_{pol}']:.3f}"
+    )
+print(
+    f"{AGGREGATION} composite {YEAR}, {pooled['area_km2']:.0f} km2 of {len(per_lake)} lakes "
+    f"({', '.join(per_lake.index)}), median {pooled['pairs']:.0f} pairs per pixel"
+)
+```
+
+## References
+
+- Kellndorfer, J., Cartus, O., Lavalle, M., et al. (2022). Global seasonal Sentinel-1
+  interferometric coherence and backscatter data set. *Scientific Data*, 9, 73.
+  <https://doi.org/10.1038/s41597-022-01189-6>

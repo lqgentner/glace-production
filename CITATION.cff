@@ -1,0 +1,50 @@
+# Citation metadata for this repository, read by GitHub ("Cite this repository")
+# and by Zenodo when it archives a release. Add the Zenodo DOI once the first
+# release has one. The dataset this code produced is listed under `references`.
+cff-version: 1.2.0
+message: If you use this code, please cite it as below. If you use the dataset, cite GLACE Alps.
+type: software
+title: GLACE production pipeline
+abstract: >-
+  The code that produced GLACE Alps, annual composites of Sentinel-1 12-day
+  interferometric coherence and terrain-corrected backscatter of the European
+  Alps, 2015–2026. It downloads, processes and composites the Sentinel-1
+  bursts, writes the inputs of the GLACE catalog, validates the composites
+  against the Swiss Glacier Inventory 2023, and generates the numbers, tables
+  and figures of the GLACE paper.
+authors:
+  - family-names: Gentner
+    given-names: Luis Q.
+    email: luis.gentner@geo.uzh.ch
+    orcid: https://orcid.org/0009-0006-4453-0881
+    affiliation: University of Zurich, Department of Geography
+license: MIT
+repository-code: https://github.com/lqgentner/glace-production
+version: "1.0"
+keywords:
+  - Sentinel-1
+  - SAR
+  - InSAR coherence
+  - backscatter
+  - glaciers
+  - Alps
+  - pipeline
+references:
+  - type: data
+    title: GLACE Alps
+    authors:
+      - family-names: Gentner
+        given-names: Luis Q.
+        orcid: https://orcid.org/0009-0006-4453-0881
+      - family-names: Piermattei
+        given-names: Livia
+        orcid: https://orcid.org/0000-0003-2814-8659
+      - family-names: Wulf
+        given-names: Hendrik
+        orcid: https://orcid.org/0000-0002-6161-428X
+    version: "1.0"
+    year: 2026
+    doi: 10.48656/60er-3j55
+    publisher:
+      name: LaRS – Language Repository of Switzerland
+    url: https://source.coop/giuz/glace-alps

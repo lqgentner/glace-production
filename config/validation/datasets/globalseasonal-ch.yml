@@ -1,0 +1,24 @@
+# Global Seasonal Sentinel-1 Interferometric Coherence and Backscatter Dataset
+# (Kellndorfer et al., 2022), summer 2020: 12-day VV coherence and VV/VH gamma0
+# (linear power, converted to dB at extraction), resampled to the 10 m MGRS grid
+# by scripts/global-seasonal/global-seasonal-patches.py --backscatter. The 5x5 window
+# statistics are derived like for the GLACE channels so the comparison is like
+# for like, although the product's native 90 m spacing leaves little for a 50 m
+# window to add.
+name: globalseasonal-ch
+comp_dir: global-seasonal/tiles-ch
+layers:
+  gs_coh_vv:
+    pattern: "GLOBALSEASONAL_COH12_{tile}_VV_SUMMER.tif"
+    kind: coherence
+    derive: [{stat: mean, window: 5}, {stat: std, window: 5}]
+  gs_bs_vv:
+    pattern: "GLOBALSEASONAL_GAMMA0_{tile}_VV_SUMMER.tif"
+    kind: backscatter
+    decibel: false
+    derive: [{stat: mean, window: 5}, {stat: std, window: 5}]
+  gs_bs_vh:
+    pattern: "GLOBALSEASONAL_GAMMA0_{tile}_VH_SUMMER.tif"
+    kind: backscatter
+    decibel: false
+    derive: [{stat: mean, window: 5}, {stat: std, window: 5}]

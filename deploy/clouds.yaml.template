@@ -1,0 +1,17 @@
+---
+# Copy to ~/.config/openstack/clouds.yaml and fill in your credentials.
+# Get these values from the OpenStack dashboard: Project → API Access → Download clouds.yaml
+# or from your OpenRC file.
+
+clouds:
+  mycloud:                      # replace with your preferred name; set cloud: mycloud in group_vars/all.yml
+    auth:
+      auth_url: https://          # e.g. https://openstack.example.com:5000/v3
+      username: ""
+      password: ""
+      project_name: ""
+      project_domain_name: Default
+      user_domain_name: Default
+    region_name: ""              # e.g. RegionOne
+    interface: public
+    identity_api_version: 3

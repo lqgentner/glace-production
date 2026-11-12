@@ -1,0 +1,7 @@
+# Copernicus GLO-30 over the Alps in WGS 84 ellipsoidal heights: the external DEM of
+# lrw-alps.yml and pass-alps.yml. The bounding box snaps out to whole 1° tiles
+# (4–17 E, 42–49 N). `output` is relative to the data directory.
+# Run: pixi run python scripts/dem/download-glo30.py --config config/dem/glo30-alps.yml
+output: dem/glo30-alps_ellipsoid.tif
+bbox: [4.3, 42.9, 17.0, 48.9]
+vertical_transform: true

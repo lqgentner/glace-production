@@ -1,0 +1,24 @@
+---
+# Run manually once you're done inspecting the VMs:
+#   pixi run -e deploy ansible-playbook deploy/teardown.yml
+#   pixi run -e deploy ansible-playbook deploy/teardown.yml -e "jobs=alps-2016,alps-2017"
+
+- name: Delete OpenStack VMs
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: List glacier-fleet VMs
+      openstack.cloud.server_info:
+        cloud: "{{ cloud }}"
+        name: "glacier-fleet-*"
+      register: vm_info
+
+    - name: Delete VM for each matched job
+      openstack.cloud.server:
+        cloud: "{{ cloud }}"
+        name: "{{ item.name }}"
+        state: absent
+        wait: true
+      loop: "{{ vm_info.servers if jobs is not defined else vm_info.servers | selectattr('name', 'in', jobs.split(',') | map('regex_replace', '^(.*)$', 'glacier-fleet-\\1') | list) | list }}"
+      loop_control:
+        label: "{{ item.name }}"

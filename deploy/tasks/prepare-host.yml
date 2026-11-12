@@ -1,0 +1,109 @@
+---
+# Everything a freshly booted VM needs before it can run a job container:
+# disarm the automatic apt timers, then make sure Docker is installed.
+#
+# `apt-daily-upgrade.timer` is `Persistent=true` with `RandomizedDelaySec=60m`,
+# so on an image that has missed its 06:00 trigger it fires shortly after boot:
+# every VM starts an unattended upgrade at an unpredictable point within an hour
+# of coming up. needrestart then restarts every daemon linked against the new
+# libc6/libsystemd0 — containerd and sshd among them — which kills an in-flight
+# `docker pull` ("failed to copy: failed to send write: EOF") and closes port 22
+# for up to a minute ("Connection refused"). Because the delay is randomized per
+# VM, a different subset of the fleet is hit on every run. Masking the timers
+# removes that race; the fleet image ships with them masked already.
+#
+# Hosts are patched by refreshing the image (`openstack_image`), not on every
+# boot: unpacking a kernel's headers alone takes over 20 minutes on these disks,
+# and a per-boot upgrade gives VMs launched on different days different
+# packages. Pass `host_upgrade: true` to drain the pending upgrades anyway, with
+# service restarts blocked via policy-rc.d and a reboot into the new packages
+# before the play continues — for a base image that has not been patched.
+
+- name: Disarm the automatic apt timers
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+    masked: true
+  loop:
+    - apt-daily.timer
+    - apt-daily-upgrade.timer
+
+# Stopping the timers does not stop a run they already started, and killing one
+# mid-transaction would leave dpkg half-configured, so let it finish instead.
+- name: Wait for any in-flight apt run to release the dpkg lock
+  ansible.builtin.shell: |
+    for _ in $(seq 180); do
+      fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || exit 0
+      sleep 10
+    done
+    exit 1
+  changed_when: false
+
+# The base image ships the Launchpad apptainer PPA, which no job uses. When
+# Launchpad answers 503, `apt-get update` only warns, but the apt module's
+# update_cache fails the play, so an outage of an unused repository stopped the
+# whole fleet (2026-09-21).
+- name: Remove the unused apptainer PPA
+  ansible.builtin.shell: |
+    removed=$(find /etc/apt/sources.list.d -name 'apptainer-*' -print -delete)
+    [ -n "$removed" ] && echo "$removed" || true
+  register: apptainer_ppa
+  changed_when: apptainer_ppa.stdout | length > 0
+
+- name: Apply the pending upgrades
+  when: host_upgrade | default(false) | bool
+  block:
+    # Without this, openssh-server's postinst restarts sshd underneath the
+    # play. The reboot below is what puts the new libraries into every daemon.
+    - name: Block service restarts for the duration of the upgrade
+      ansible.builtin.copy:
+        dest: /usr/sbin/policy-rc.d
+        mode: '0755'
+        content: |
+          #!/bin/sh
+          exit 101
+
+    - name: Upgrade all packages
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: true
+        lock_timeout: 1800
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+        NEEDRESTART_MODE: l
+      register: host_upgrade_result
+
+  always:
+    - name: Unblock service restarts
+      ansible.builtin.file:
+        path: /usr/sbin/policy-rc.d
+        state: absent
+
+- name: Reboot into the upgraded system
+  ansible.builtin.reboot:
+    connect_timeout: 30
+    reboot_timeout: 900
+    post_reboot_delay: 15
+  when: host_upgrade_result is defined and host_upgrade_result.changed
+
+- name: Check for Docker
+  ansible.builtin.stat:
+    path: /usr/bin/docker
+  register: docker_bin
+
+# The fleet image has Docker already, so the cache is refreshed only when it
+# is missing; an unreachable mirror then cannot stop a fleet that installs
+# nothing.
+- name: Install Docker
+  ansible.builtin.apt:
+    name: docker.io
+    state: present
+    update_cache: "{{ not docker_bin.stat.exists }}"
+    lock_timeout: 300
+
+- name: Add ubuntu to docker group
+  ansible.builtin.user:
+    name: ubuntu
+    groups: docker
+    append: true

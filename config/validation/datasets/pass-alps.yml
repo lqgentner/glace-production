@@ -1,0 +1,49 @@
+# Per-pass composites of the Alpine glaciers (config/pass-alps.yml, s1bursts 0.9,
+# 2021-2024): ascending (A)
+# and descending (D) orbits composited separately (alps-total compositing window,
+# 35x7 coherence window, unweighted mean, linear RTC), one pair of files per channel
+# and pass. Every layer derives its 5x5 window mean and standard deviation like the
+# merged composites of `lrw-alps`; a pass that misses a pixel leaves it NaN, so the
+# common support of a run with both datasets is the intersection of the passes.
+# The run covers the Paul et al. (2020) outlines, not SGI2023, and lacks five tiles
+# with validation locations (32TMS27, 32TNS75, 32TNS87, 32TNT23, 32TPS09; 0.15 % of
+# them): extract with --allow-missing, and those rows leave the common support.
+name: pass-alps
+comp_dir: alps-total/{year}/s1-comp-pass
+layers:
+  coh_vv_a:
+    pattern: "S1_COH12_COMP_A_{tile}_VV_*.tif"
+    kind: coherence
+    derive: [{stat: mean, window: 5}, {stat: std, window: 5}]
+  coh_vh_a:
+    pattern: "S1_COH12_COMP_A_{tile}_VH_*.tif"
+    kind: coherence
+    derive: [{stat: mean, window: 5}, {stat: std, window: 5}]
+  coh_vv_d:
+    pattern: "S1_COH12_COMP_D_{tile}_VV_*.tif"
+    kind: coherence
+    derive: [{stat: mean, window: 5}, {stat: std, window: 5}]
+  coh_vh_d:
+    pattern: "S1_COH12_COMP_D_{tile}_VH_*.tif"
+    kind: coherence
+    derive: [{stat: mean, window: 5}, {stat: std, window: 5}]
+  rtc_vv_a:
+    pattern: "S1_RTC_COMP_A_{tile}_VV_*.tif"
+    kind: backscatter
+    decibel: false
+    derive: [{stat: mean, window: 5}, {stat: std, window: 5}]
+  rtc_vh_a:
+    pattern: "S1_RTC_COMP_A_{tile}_VH_*.tif"
+    kind: backscatter
+    decibel: false
+    derive: [{stat: mean, window: 5}, {stat: std, window: 5}]
+  rtc_vv_d:
+    pattern: "S1_RTC_COMP_D_{tile}_VV_*.tif"
+    kind: backscatter
+    decibel: false
+    derive: [{stat: mean, window: 5}, {stat: std, window: 5}]
+  rtc_vh_d:
+    pattern: "S1_RTC_COMP_D_{tile}_VH_*.tif"
+    kind: backscatter
+    decibel: false
+    derive: [{stat: mean, window: 5}, {stat: std, window: 5}]

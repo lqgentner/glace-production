@@ -1,0 +1,63 @@
+---
+title: "Debris cover of SGI2023"
+format:
+  html:
+    embed-resources: true
+jupyter: python3
+---
+
+The debris-covered fraction of the Swiss glacier area in SGI2023, from the inventory's
+own debris-cover layer (product `D`): the summed area of the debris polygons over the
+summed area of the glacier outlines. Both areas are the inventory's `area_km2`
+attribute. SGI2016 is computed the same way as a check against the 11 % of Linsbauer et
+al. (2021). The numbers are saved as a CSV in `REPORT_DIR`.
+
+```{python}
+import geopandas as gpd
+import pandas as pd
+
+from glace_production.config import settings
+from glace_production.datasets import SGI2016, SGI2023
+```
+
+## Configuration
+
+```{python}
+NAME = "debris-cover"  # saved as {NAME}.csv in REPORT_DIR
+REPORT_DIR = settings.reports_dir / NAME  # one folder per notebook
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+INVENTORIES = {"SGI2023": SGI2023, "SGI2016": SGI2016}
+```
+
+## Debris-covered fraction
+
+The debris polygons lie inside the glacier outlines, so the fraction needs no
+intersection; `outside_m2` is the debris area outside the outlines, to confirm it.
+
+```{python}
+def debris_row(glaciers: gpd.GeoDataFrame, debris: gpd.GeoDataFrame) -> dict[str, float]:
+    glacier_km2 = glaciers["area_km2"].sum()
+    debris_km2 = debris["area_km2"].sum()
+    return {
+        "glaciers": len(glaciers),
+        "glaciers_with_debris": debris["sgi-id"].nunique(),
+        "glacier_km2": glacier_km2,
+        "debris_km2": debris_km2,
+        "debris_pct": 100 * debris_km2 / glacier_km2,
+        "outside_m2": debris.union_all().difference(glaciers.union_all()).area,
+    }
+
+
+table = pd.DataFrame(
+    {
+        name: debris_row(
+            inventory(product="G").get_data(download=True),
+            inventory(product="D").get_data(download=True),
+        )
+        for name, inventory in INVENTORIES.items()
+    }
+).T
+table.to_csv(REPORT_DIR / f"{NAME}.csv", float_format="%.2f")
+table.round(2)
+```

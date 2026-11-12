@@ -1,0 +1,156 @@
+---
+title: "LRW weight cap"
+format:
+  html:
+    embed-resources: true
+jupyter: python3
+---
+
+Local resolution weighting weights each observation by $r = 1/A$, the inverse of the
+local scattering area, and caps it at `clip_max_resolution` ($r_\text{max}$). On slopes
+facing away from the sensor close to radar shadow $A \to 0$, so without a cap a single
+observation would dominate the composite, at a resolution the DEM cannot support. This
+notebook gives the quantile of $r$ at which a cap sits, over every burst footprint that
+touches the area around the Great Aletsch Glacier (7.72–8.32° E, 46.34–46.66° N). The quantile is a
+property of the weights alone and holds for any aggregation.
+
+$A$ changes little between the acquisitions of one relative orbit
+(`static-scattering-area.qmd`), so one acquisition per burst footprint is enough: the
+first of the year's compositing window. Radar shadow is NaN in the products and has
+no weight.
+
+```{python}
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import shapely
+from s1bursts.burstmap import Sentinel1Bursts
+import yaml
+
+from freezebase.raster import rasterio_open
+
+from glace_production.config import settings
+from data_paths import LRW_CONFIG, run_dirs
+```
+
+## Configuration
+
+```{python}
+AOI = shapely.box(7.72, 46.34, 8.32, 46.66)  # lon/lat
+YEAR = 2025
+POLARIZATION = "VV"  # VV and VH products carry the same scattering area
+AREA_BAND = 2  # band 1 is gamma0, band 2 the scattering area
+CAPS = (1.5, 2.0, 3.0, 5.0, 10.0)
+QUANTILES = (0.5, 0.9, 0.95, 0.98, 0.99, 0.999)
+SUBSET_SIZES = (1, 3, 5, 10)
+N_DRAWS = 1000
+N_WORKERS = 8
+SEED = 0
+
+WEIGHT_CAP = yaml.safe_load(LRW_CONFIG.read_text())["clip_max_resolution"]
+assert WEIGHT_CAP in CAPS
+PROD_DIR = run_dirs(YEAR).prod_dir
+```
+
+## Bursts
+
+Every burst of the Sentinel-1 burst-ID map that intersects the area, with its first
+acquisition of the year.
+
+```{python}
+burst_map = Sentinel1Bursts().get_data(download=False)
+bursts = burst_map[burst_map.intersects(AOI)]
+keys = {
+    f"{b.relative_orbit_number:03d}_{b.burst_id:06d}_{b.subswath_name}"
+    for b in bursts.itertuples()
+}
+
+first: dict[str, Path] = {}
+for f in sorted(PROD_DIR.iterdir(), key=lambda f: f.name):  # date order within a burst
+    if f.name.startswith("S1_RTC_") and f"_{POLARIZATION}_" in f.name:
+        # S1_RTC_015A_030346_IW1_VV_…: orbit, pass, burst ID and sub-swath
+        first.setdefault(f"{f.name[7:10]}_{f.name[12:22]}", f)
+files = [first[k] for k in sorted(keys & first.keys())]
+print(
+    f"{len(files)} of {len(keys)} bursts processed, on relative orbits "
+    f"{sorted({int(f.name[7:10]) for f in files})}"
+)
+```
+
+## Distribution
+
+$r$ of every valid pixel of each burst, over the whole burst footprint.
+
+```{python}
+def read_r(f: Path) -> np.ndarray:
+    """Valid ``1/A`` of burst product ``f``."""
+    with rasterio_open(f) as src:
+        a = src.read(AREA_BAND)
+    return 1 / a[np.isfinite(a) & (a > 0)]
+
+
+with ThreadPoolExecutor(N_WORKERS) as ex:
+    r_bursts = list(ex.map(read_r, files))
+r_all = np.concatenate(r_bursts)
+print(f"{r_all.size / 1e6:.0f} M observations")
+```
+
+The quantile of $r$ at which each cap sits, i.e. the share of observations it leaves
+untouched, and the quantiles of $r$:
+
+```{python}
+print(
+    pd.DataFrame(
+        {"cap": [f"{c:g}" for c in CAPS], "quantile": [np.mean(r_all <= c) for c in CAPS]}
+    ).to_string(index=False, float_format="{:.3f}".format)
+)
+print()
+print(
+    pd.DataFrame({"quantile": QUANTILES, "r": np.quantile(r_all, QUANTILES)}).to_string(
+        index=False, float_format="{:.3g}".format
+    )
+)
+print(
+    f"\nThe current cap r_max = {WEIGHT_CAP:g} is the {np.mean(r_all <= WEIGHT_CAP):.1%} quantile."
+)
+```
+
+Per burst, the quantile of each cap depends on the sub-swath and the terrain the
+burst covers:
+
+```{python}
+per_burst = pd.DataFrame(
+    [
+        {"burst": f.name[7:22]} | {f"{c:g}": np.mean(r <= c) for c in CAPS}
+        for f, r in zip(files, r_bursts, strict=True)
+    ]
+).set_index("burst")
+print(per_burst.to_string(float_format="{:.3f}".format))
+```
+
+## Fewer bursts
+
+The quantile of the current cap from random subsets of the bursts, pooled as above:
+median and 5–95 % range over the draws.
+
+```{python}
+n = np.array([r.size for r in r_bursts])
+below = np.array([np.sum(r <= WEIGHT_CAP) for r in r_bursts])
+rng = np.random.default_rng(SEED)
+rows = []
+for k in SUBSET_SIZES:
+    draws = [rng.choice(len(files), k, replace=False) for _ in range(N_DRAWS)]
+    q = np.array([below[d].sum() / n[d].sum() for d in draws])
+    rows.append(
+        {
+            "bursts": k,
+            "median": np.median(q),
+            "5 %": np.quantile(q, 0.05),
+            "95 %": np.quantile(q, 0.95),
+        }
+    )
+rows.append({"bursts": len(files), "median": below.sum() / n.sum()})
+print(pd.DataFrame(rows).to_string(index=False, float_format="{:.3f}".format, na_rep=""))
+```

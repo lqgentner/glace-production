@@ -1,0 +1,76 @@
+# Environments
+.env*
+!.env.example
+.venv/
+
+# Storage
+data/
+cache/
+models/
+temp/
+
+# Python temp files
+__pycache__
+
+# macOS
+**/.DS_Store
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# mypy
+.mypy_cache/
+.dmypy*.json
+dmypy.json
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Log files
+logs/
+*.log
+
+# GDAL
+*.ovr.tmp
+
+# Quarto
+/.quarto/
+**/*_files/
+*.html
+**/*.quarto_ipynb
+/_freeze/
+
+# pixi
+/.pixi/
+
+# Local agent plans and specs (superpowers), kept out of the repository
+.docs/

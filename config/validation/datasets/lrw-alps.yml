@@ -1,0 +1,29 @@
+# The published GLACE composites (s1bursts 0.9): the tiles of the Alps-wide run (lrw-alps.yml:
+# alps-total compositing window, 35x7 coherence window, resolution-weighted mean
+# with the weight capped at 5, linear RTC). Only the tiles holding validation
+# locations are read, but every tile of the run serves as a halo neighbour.
+# Every measurement layer also derives its 5x5 (50 m) window mean and standard
+# deviation at extraction (columns <layer>_mean5, <layer>_std5), NaN where the
+# window holds nodata or reaches past a tile edge without a neighbour.
+name: lrw-alps
+comp_dir: alps-total/{year}/s1-comp
+layers:
+  coh_vv:
+    pattern: "S1_COH12_LRW_{tile}_VV_*.tif"
+    kind: coherence
+    derive: [{stat: mean, window: 5}, {stat: std, window: 5}]
+  coh_vh:
+    pattern: "S1_COH12_LRW_{tile}_VH_*.tif"
+    kind: coherence
+    derive: [{stat: mean, window: 5}, {stat: std, window: 5}]
+  rtc_vv:
+    pattern: "S1_RTC_LRW_{tile}_VV_*.tif"
+    kind: backscatter
+    decibel: false
+    derive: [{stat: mean, window: 5}, {stat: std, window: 5}]
+  rtc_vh:
+    pattern: "S1_RTC_LRW_{tile}_VH_*.tif"
+    kind: backscatter
+    decibel: false
+    derive: [{stat: mean, window: 5}, {stat: std, window: 5}]
+  n_obs_vv: {pattern: "S1_COH12_LRW_QA-NUM_{tile}_VV_*.tif", kind: count}

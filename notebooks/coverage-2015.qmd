@@ -1,0 +1,259 @@
+---
+title: "Coverage in 2015"
+format:
+  html:
+    embed-resources: true
+jupyter: python3
+---
+
+Checks the paragraph *Coverage in 2015* of the Usage Notes against the composites of
+the Alps-wide run (`alps-total/{year}/s1-comp`):
+
+> All years except 2015 contain all 2210 tiles with all twelve layers. In 2015, 89 tiles
+> in the north-central Alps contain backscatter but no coherence, and two tiles
+> (32TNT14 and 32TNT24) are absent. […] Seven RGI 7.0 glaciers (0.8 km²) lie entirely
+> within the tiles without coherence. In 2015, another 46 glaciers have invalid pixels
+> in at least one layer, none of them more than 30 %.
+
+The tile counts come from the run manifests. The glacier counts take the RGI 7.0
+glaciers (region 11, Central Europe) that intersect the tiles of the scope, rasterized
+to the 10 m grid of every tile they intersect, pixel centres inside the outline. A
+pixel of a measurement layer (coherence or backscatter, VV or VH) is invalid where it
+is NaN, or where the layer, or the whole tile, is missing. The quality layers share
+the measurement layer's mask, so they are not read.
+
+A glacier's invalid share of a layer is the share of its pixels that are invalid,
+counted over the tiles of one UTM zone, which do not overlap. Along the zone boundaries
+a glacier can lie in the tiles of two zones; it then takes the larger of the two
+shares, as a user of either tile set sees that much. A glacier counts as without
+coherence where both coherence layers are invalid on all of its pixels, and as having
+invalid pixels where any layer is invalid on at least one.
+
+```{python}
+from concurrent.futures import ThreadPoolExecutor
+import warnings
+
+from freezebase.mgrs import MGRSGeoBox
+from freezebase.raster import rasterio_open
+import numpy as np
+import pandas as pd
+from rasterio.errors import NotGeoreferencedWarning
+from rasterio.features import rasterize
+
+from glace_production.config import settings
+from data_paths import run_dirs, run_scope
+from glace_production.datasets.rgi import RGI7
+from tiles import scope_tiles
+```
+
+## Configuration
+
+```{python}
+YEAR = 2015
+YEARS = range(2015, 2026 + 1)  # for the check that the other years are complete
+SCOPE = run_scope()
+REPORT_NAME = "coverage-2015"  # CSVs saved in REPORT_DIR
+REPORT_DIR = settings.reports_dir / REPORT_NAME  # one folder per notebook
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+LAYERS = [("COH12", "VV"), ("COH12", "VH"), ("RTC", "VV"), ("RTC", "VH")]
+COHERENCE = [f"COH12_{pol}" for pol in ("VV", "VH")]
+LAYERS_PER_TILE = 12
+WORKERS = 8  # tiles read at once
+
+# The paragraph as it stands in the paper
+PAPER = {
+    "tiles": 2210,
+    "tiles without coherence": 89,
+    "absent tiles": "32TNT14, 32TNT24",
+    "glaciers without coherence": 7,
+    "their area (km²)": 0.8,
+    "other glaciers with invalid pixels": 46,
+    "all glaciers with invalid pixels": "",
+    "largest invalid share (%)": 30,
+}
+found: dict[str, object] = {}
+```
+
+## Tiles
+
+```{python}
+def read_manifest(year: int) -> pd.DataFrame:
+    """The run manifest of a year: one row per composite file."""
+    with (run_dirs(year).comp_dir / "manifest.parquet").open("rb") as f:
+        return pd.read_parquet(
+            f, columns=["filename", "tile", "product", "polarization", "qa", "stat_valid_percent"]
+        )
+
+
+grid = scope_tiles(SCOPE)
+found["tiles"] = len(grid)
+print(f"{len(grid)} tiles in the {SCOPE} grid")
+
+completeness = {}
+for year in YEARS:
+    per_tile = read_manifest(year).groupby("tile").size().reindex(grid["tile"], fill_value=0)
+    completeness[year] = {
+        "all layers": int((per_tile == LAYERS_PER_TILE).sum()),
+        "some layers": int(per_tile.between(1, LAYERS_PER_TILE - 1).sum()),
+        "absent": int((per_tile == 0).sum()),
+    }
+pd.DataFrame(completeness).T
+```
+
+```{python}
+manifest = read_manifest(YEAR)
+assert set(manifest["tile"]) <= set(grid["tile"])
+measurements = manifest[manifest["qa"].isna()]
+files = measurements.set_index(["tile", "product", "polarization"])["filename"]
+products = measurements.groupby("tile")["product"].agg(set)
+
+absent = sorted(set(grid["tile"]) - set(manifest["tile"]))
+no_coherence = sorted(products.index[products.map(lambda p: p == {"RTC"})])
+found["tiles without coherence"] = len(no_coherence)
+found["absent tiles"] = ", ".join(absent)
+print(f"{YEAR}: {len(absent)} absent tiles ({', '.join(absent)})")
+print(f"{YEAR}: {len(no_coherence)} tiles with backscatter but no coherence")
+```
+
+The tiles that can hold invalid pixels: the absent ones, those without coherence, and
+those with a measurement layer under 100 % valid in the manifest.
+
+```{python}
+partial = measurements.loc[measurements["stat_valid_percent"] < 100, "tile"]
+suspect = set(absent) | set(no_coherence) | set(partial)
+print(f"{len(set(partial))} tiles with a measurement layer under 100 % valid")
+print(f"{len(suspect)} tiles that can hold invalid pixels")
+```
+
+## Glaciers
+
+```{python}
+rgi = RGI7(product="G", region="11").get_data(download=False)[["area_km2", "geometry"]]
+rgi = rgi.to_crs(grid.crs)
+in_scope = rgi.iloc[np.unique(grid.sindex.query(rgi.geometry, predicate="intersects")[0])]
+suspect_tiles = grid[grid["tile"].isin(suspect)]
+candidates = in_scope.iloc[
+    np.unique(suspect_tiles.sindex.query(in_scope.geometry, predicate="intersects")[0])
+]
+# Every tile a candidate intersects, so that its share is taken over all of its pixels
+read_tiles = sorted(
+    grid["tile"].iloc[np.unique(grid.sindex.query(candidates.geometry, predicate="intersects")[1])]
+)
+print(f"{len(in_scope)} RGI 7.0 glaciers intersect the scope, {len(candidates)} a suspect tile")
+print(f"{len(read_tiles)} tiles to read")
+```
+
+Every tile is rasterized with the candidates' positions as labels (RGI outlines do not
+overlap), so one `bincount` gives each glacier's pixels and another its invalid ones.
+
+```{python}
+projected = {epsg: candidates.to_crs(epsg) for epsg in grid["epsg"].unique()}
+
+
+def invalid_mask(tile: str, product: str, pol: str, shape: tuple[int, int]) -> np.ndarray:
+    """True where a measurement layer of a tile is invalid; all of it if the file is missing."""
+    name = files.get((tile, product, pol))
+    if name is None:
+        return np.ones(shape, dtype=bool)
+    with rasterio_open(run_dirs(YEAR).comp_dir / name) as src:
+        values = src.read(1)
+        nodata = src.nodata
+    invalid = ~np.isfinite(values)
+    if nodata is not None and not np.isnan(nodata):
+        invalid |= values == nodata
+    return invalid
+
+
+def count_tile(tile: str) -> pd.DataFrame:
+    """Pixels and invalid pixels per layer of every candidate glacier in one tile."""
+    geobox = MGRSGeoBox.from_mgrs(tile)
+    shape = (geobox.shape.y, geobox.shape.x)
+    glaciers = projected[geobox.crs.epsg]
+    inside = glaciers.sindex.query(geobox.extent.geom, predicate="intersects")
+    labels = rasterize(
+        zip(glaciers.geometry.iloc[inside], inside + 1, strict=True),
+        out_shape=shape,
+        transform=geobox.transform,
+        fill=0,
+        dtype="int32",
+    )
+    n = len(glaciers) + 1
+    counts = pd.DataFrame(
+        {"position": np.arange(n), "pixels": np.bincount(labels.ravel(), minlength=n)}
+    )
+    for product, pol in LAYERS:
+        invalid = invalid_mask(tile, product, pol, shape)
+        counts[f"{product}_{pol}"] = np.bincount(labels[invalid], minlength=n)
+    counts = counts[(counts["position"] > 0) & (counts["pixels"] > 0)]
+    return counts.assign(tile=tile, epsg=geobox.crs.epsg, position=counts["position"] - 1)
+
+
+# rasterize warns that its in-memory raster has no transform when it runs in threads,
+# though it applies the one it is given: the pixel counts match the RGI areas below.
+warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
+with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+    counts = pd.concat(pool.map(count_tile, read_tiles), ignore_index=True)
+counts["rgi_id"] = candidates.index[counts["position"]]
+counts.to_csv(REPORT_DIR / "glacier-tile-pixels.csv", index=False)
+```
+
+```{python}
+layer_names = [f"{product}_{pol}" for product, pol in LAYERS]
+per_zone = counts.groupby(["rgi_id", "epsg"])[["pixels", *layer_names]].sum()
+shares = per_zone[layer_names].div(per_zone["pixels"], axis=0).groupby("rgi_id").max()
+glaciers = candidates[["area_km2"]].join(shares, how="inner")
+glaciers["pixels"] = per_zone["pixels"].groupby("rgi_id").max()
+glaciers["max_share"] = glaciers[layer_names].max(axis=1)
+glaciers["in_absent_tile"] = glaciers.index.isin(counts.loc[counts["tile"].isin(absent), "rgi_id"])
+glaciers["without_coherence"] = (glaciers[COHERENCE] == 1).all(axis=1)
+glaciers["within_no_coherence_tiles"] = glaciers.index.isin(
+    candidates.index[candidates.within(grid[grid["tile"].isin(no_coherence)].union_all())]
+)
+glaciers.sort_values("max_share", ascending=False).to_csv(REPORT_DIR / "glaciers.csv")
+print(f"{len(candidates) - len(glaciers)} candidates have no pixel centre inside their outline")
+print(f"{glaciers['in_absent_tile'].sum()} glaciers have pixels in an absent tile")
+```
+
+### Glaciers without coherence
+
+The paper counts the glaciers that lie entirely within the tiles without coherence;
+the pixel test, both coherence layers invalid on every pixel, should find the same.
+
+```{python}
+without = glaciers[glaciers["without_coherence"]]
+within = glaciers[glaciers["within_no_coherence_tiles"]]
+found["glaciers without coherence"] = len(without)
+found["their area (km²)"] = round(without["area_km2"].sum(), 1)
+print(f"no coherence on any pixel: {len(without)} glaciers, {without['area_km2'].sum():.2f} km²")
+print(
+    f"within the tiles without coherence: {len(within)} glaciers, {within['area_km2'].sum():.2f} km²"
+)
+print(f"same glaciers: {set(without.index) == set(within.index)}")
+without[["area_km2", "pixels", *layer_names]].round(3)
+```
+
+### Other glaciers with invalid pixels
+
+```{python}
+other = glaciers[~glaciers["without_coherence"] & (glaciers["max_share"] > 0)]
+found["other glaciers with invalid pixels"] = len(other)
+# with the glaciers without coherence, which also have invalid pixels
+found["all glaciers with invalid pixels"] = len(other) + len(without)
+found["largest invalid share (%)"] = round(100 * other["max_share"].max(), 1)
+by_layer = (other[layer_names] > 0).sum()
+print(f"{len(other)} other glaciers with invalid pixels, {other['area_km2'].sum():.1f} km²")
+print("glaciers with invalid pixels per layer:", by_layer.to_dict())
+print(
+    "invalid share, percentiles 50/90/100:",
+    np.percentile(100 * other["max_share"], [50, 90, 100]).round(1),
+)
+other.sort_values("max_share", ascending=False)[
+    ["area_km2", "pixels", *layer_names, "max_share"]
+].head(15).round(3)
+```
+
+## Against the paper
+
+```{python}
+pd.DataFrame({"paper": PAPER, "composites": found}).astype(str)
+```

@@ -1,0 +1,236 @@
+---
+# Deploys one persistent, long-running VM per job (a "fleet"), each running its
+# own container until its script finishes. Jobs (script + config to run) are
+# defined in a jobs manifest (jobs-lrw.yml by default, `jobs_file` to pick
+# another), not hardcoded here — this playbook doesn't know or care about
+# "years", "Alps", or "mean vs median" specifically. For a single ad-hoc VM
+# that tears itself down when its command completes, use run.yml instead.
+#
+# Usage:
+#   pixi run -e deploy ansible-playbook deploy/fleet.yml                                  # all of jobs-lrw.yml
+#   pixi run -e deploy ansible-playbook deploy/fleet.yml -e "jobs_file=jobs-pass.yml"     # the per-pass fleet
+#   pixi run -e deploy ansible-playbook deploy/fleet.yml -e "jobs=alps-2022"              # single job
+
+- name: Create OpenStack VMs
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    github_token: "{{ lookup('env', 'GITHUB_TOKEN') | default(lookup('pipe', 'gh auth token'), true) }}"
+    github_actor: "{{ lookup('env', 'GITHUB_ACTOR') | default(lookup('pipe', 'gh api user --jq .login'), true) }}"
+    all_jobs: "{{ (lookup('file', playbook_dir + '/' + (jobs_file | default('jobs-lrw.yml', true))) | from_yaml).jobs }}"
+    selected_jobs: "{{ all_jobs if jobs is not defined else all_jobs | selectattr('name', 'in', jobs.split(',')) | list }}"
+
+  tasks:
+    - name: Fail if no jobs matched
+      ansible.builtin.fail:
+        msg: "No jobs matched '{{ jobs | default('') }}'. Available: {{ all_jobs | map(attribute='name') | join(', ') }}"
+      when: selected_jobs | length == 0
+
+    - name: Parse local .env into vars
+      ansible.builtin.set_fact:
+        local_env: >-
+          {{ lookup('file', playbook_dir + '/../.env').splitlines()
+            | select('match', '^[A-Z]')
+            | map('split', '=', 1)
+            | list
+            | items2dict(key_name=0, value_name=1) }}
+      no_log: true
+
+    - name: Render .env content for VMs
+      ansible.builtin.set_fact:
+        env_content: "{{ lookup('template', playbook_dir + '/env.j2') }}"
+        ee_key_file: "{{ local_env['EE_SERVICE_ACC_KEY_FILE'] }}"
+      no_log: true
+
+    - name: Render AWS credentials for VMs
+      ansible.builtin.set_fact:
+        aws_credentials_content: "{{ lookup('template', playbook_dir + '/aws-credentials.j2') }}"
+      no_log: true
+
+    - name: Create VM for each job
+      openstack.cloud.server:
+        cloud: "{{ cloud }}"
+        name: "glacier-fleet-{{ item.name }}"
+        image: "{{ openstack_image }}"
+        flavor: "{{ openstack_flavor }}"
+        network: "{{ openstack_network }}"
+        key_name: "{{ openstack_keypair }}"
+        security_groups: "{{ openstack_security_groups }}"
+        auto_ip: false
+        wait: true
+        state: present
+      loop: "{{ selected_jobs }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: vm_jobs
+      async: 600
+      poll: 0
+
+    - name: Wait for VM creation
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: vms
+      until: vms.finished
+      retries: 60
+      delay: 10
+      loop: "{{ vm_jobs.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Retrieve SSH host keys via ssh-keyscan
+      ansible.builtin.shell: |
+        for i in $(seq 55); do
+          out=$(ssh-keyscan -t ed25519 -T 5 {{ item.server.addresses[openstack_network][0].addr }} 2>/dev/null)
+          if [ -n "$out" ]; then
+            echo "$out"
+            exit 0
+          fi
+          sleep 10
+        done
+        exit 1
+      loop: "{{ vms.results }}"
+      loop_control:
+        label: "{{ item.server.name }}"
+      register: keyscan_jobs
+      async: 600
+      poll: 0
+      changed_when: false
+
+    - name: Wait for SSH host keys
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: keyscan_result
+      until: keyscan_result.finished
+      retries: 60
+      delay: 10
+      loop: "{{ keyscan_jobs.results }}"
+      loop_control:
+        label: "{{ item.item.server.name }}"
+
+    - name: Add VM host keys to known_hosts
+      ansible.builtin.known_hosts:
+        name: "{{ item.0.server.addresses[openstack_network][0].addr }}"
+        key: "{{ item.1.stdout_lines | reject('match', '^#') | first }}"
+        state: present
+      loop: "{{ vms.results | zip(keyscan_result.results) | list }}"
+      loop_control:
+        label: "{{ item.0.server.name }}"
+
+    - name: Register VMs in inventory
+      ansible.builtin.add_host:
+        name: "{{ item.1.server.addresses[openstack_network][0].addr }}"
+        groups: glacier_vms
+        job_name: "{{ item.0.name }}"
+        job_script: "{{ item.0.script }}"
+        job_config: "{{ item.0.config }}"
+        job_args: "{{ item.0.args | default('') }}"
+        ansible_user: ubuntu
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: '-o GSSAPIAuthentication=no'
+      loop: "{{ selected_jobs | zip(vms.results) | list }}"
+      loop_control:
+        label: "{{ item.0.name }}"
+
+
+- name: Bootstrap VMs and launch containers
+  hosts: glacier_vms
+  gather_facts: false
+  become: true
+  tags: launch
+  vars:
+    github_token: "{{ lookup('env', 'GITHUB_TOKEN') | default(lookup('pipe', 'gh auth token'), true) }}"
+    github_actor: "{{ lookup('env', 'GITHUB_ACTOR') | default(lookup('pipe', 'gh api user --jq .login'), true) }}"
+
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Prepare the host (upgrade, reboot, Docker)
+      ansible.builtin.include_tasks: tasks/prepare-host.yml
+
+    - name: Create logs directory
+      ansible.builtin.file:
+        path: /home/ubuntu/logs
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Write .env file
+      ansible.builtin.copy:
+        content: "{{ hostvars['localhost']['env_content'] }}"
+        dest: /home/ubuntu/.env
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+
+    - name: Create secrets directory
+      ansible.builtin.file:
+        path: /home/ubuntu/secrets
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0700'
+
+    - name: Copy EE service account key
+      ansible.builtin.copy:
+        src: "{{ hostvars['localhost']['ee_key_file'] }}"
+        dest: /home/ubuntu/secrets/ee-service-account.json
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+
+    - name: Write AWS credentials file
+      ansible.builtin.copy:
+        content: "{{ hostvars['localhost']['aws_credentials_content'] }}"
+        dest: /home/ubuntu/secrets/aws-credentials
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+      no_log: true
+
+    - name: Log in to ghcr.io
+      community.docker.docker_login:
+        registry: ghcr.io
+        username: "{{ github_actor }}"
+        password: "{{ github_token }}"
+
+    - name: Pull Docker image
+      community.docker.docker_image:
+        name: "{{ hostvars['localhost']['image'] }}"
+        source: pull
+        force_source: true
+      async: 600
+      poll: 15
+
+    - name: Launch container
+      community.docker.docker_container:
+        name: "glacier-fleet-{{ job_name }}"
+        image: "{{ hostvars['localhost']['image'] }}"
+        env_file: /home/ubuntu/.env
+        volumes:
+          - /home/ubuntu/logs:/app/logs
+          - /home/ubuntu/secrets/ee-service-account.json:/app/secrets/ee-service-account.json
+          - /home/ubuntu/secrets/aws-credentials:/app/secrets/aws-credentials:ro
+        command: "python {{ job_script }} {{ job_config }} {{ job_args }}"
+        detach: true
+        state: started
+
+- name: Print monitoring commands
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+  tasks:
+    - name: Print monitoring commands
+      ansible.builtin.debug:
+        msg:
+          - "VM {{ item.server.name }} ({{ item.server.addresses[openstack_network][0].addr }})"
+          - "SSH: ssh ubuntu@{{ item.server.addresses[openstack_network][0].addr }}"
+          - "Logs: ssh ubuntu@{{ item.server.addresses[openstack_network][0].addr }} 'sudo docker logs -f {{ item.server.name }}'"
+      loop: "{{ hostvars['localhost']['vms'].results }}"
+      loop_control:
+        label: "{{ item.server.name }}"

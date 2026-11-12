@@ -1,0 +1,341 @@
+---
+title: "Burst counts"
+format:
+  html:
+    embed-resources: true
+jupyter: python3
+---
+
+The Sentinel-1 bursts and 12-day burst pairs behind the Alpine GLACE composites of each
+year, with the year's compositing window and the total, as booktabs `tabular`s with and
+without the satellites, saved in `REPORT_DIR` together with a CSV of the counts per
+polarization.
+
+The composite run (`glace_production.composites.run_composite`) searches the CDSE burst
+catalog once per MGRS tile and polarization, over the tile's geographic bounding box
+and the year's compositing window, and pairs the bursts it found at the 12-day
+baseline (`find_pairs`). A burst overlapping several tiles is used by each of them, so
+neither the run manifest (whose `CONTRIBUTING_OBSERVATIONS` counts passes per tile)
+nor the SLC and product directories (which may hold other search windows) give the
+unique count. This notebook repeats the selection instead: one paged catalog search per
+year and polarization over the bounding box of all tiles, then the bursts each tile's
+own search would have found, on the footprints the catalog returns, and the pairs
+within each tile. A pair needs both bursts in one common tile.
+
+| Quantity | Counted as |
+| --- | --- |
+| Burst | One acquisition of a burst footprint: relative orbit, burst ID, sub-swath and date. It is downloaded and processed in VV and VH |
+| Burst pair | Two bursts of the same footprint 12 days ± the run's `pair_tolerance_hours` apart |
+
+The table counts bursts and pairs in either polarization; the CSV has them per
+polarization, where `tile_bursts` is the sum over the tiles that use each burst.
+
+```{python}
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, timedelta
+import time
+from typing import Any
+
+from freezebase.mgrs import MGRSGrid
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import requests
+from s1bursts import BurstCatalog, SearchQuery, TimeRange
+from s1bursts.burst import BurstCollection
+from s1bursts.errors import TooManyResultsError
+import shapely
+
+from glace_production.composites import CompositeConfig, find_pairs, resolve_aoi
+from glace_production.config import settings
+from data_paths import LRW_CONFIG, run_dirs
+```
+
+## Configuration
+
+```{python}
+TABLE_NAME = "burst-counts"  # saved as {TABLE_NAME}[-satellites].tex and .csv in REPORT_DIR
+REPORT_DIR = settings.reports_dir / TABLE_NAME  # one folder per notebook
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+YEARS = range(2015, 2026 + 1)
+# Catalog searches take minutes each, so their results are kept and a rerun makes none.
+CACHE_DIR = settings.cache_dir / TABLE_NAME
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+```
+
+A year's run configuration is the `config.yaml` it saved beside its composites, or the
+repository config for that year where there is none. Both take the window from
+`config/windows/alps-total.yml`.
+
+```{python}
+def load_run_config(year: int) -> CompositeConfig:
+    """Return the configuration of a year's composite run."""
+    saved = run_dirs(year).comp_dir / "config.yaml"
+    if saved.exists():
+        return CompositeConfig.from_yaml(saved)
+    return CompositeConfig.from_yaml(LRW_CONFIG, overrides=[f"year={year}"])
+
+
+configs = {year: load_run_config(year) for year in YEARS}
+pd.DataFrame(
+    {
+        year: {
+            "window": str(c.time_range),
+            "polarizations": "/".join(c.polarizations),
+            "baseline (d)": c.baseline_days,
+            "pair tolerance (h)": c.pair_tolerance_hours,
+        }
+        for year, c in configs.items()
+    }
+).T
+```
+
+## Tiles
+
+All years share one grid: the scope, pixel size and AOI parameters are the same in
+every run. A tile's search polygon is its geographic bounding box, as in
+`_process_cell`.
+
+```{python}
+grid_params = {
+    (c.scope, c.pixel_size_m, c.simplify_m, c.glacier_buffer_m) for c in configs.values()
+}
+assert len(grid_params) == 1, grid_params
+first = next(iter(configs.values()))
+aoi = resolve_aoi(
+    first.scope, simplify_m=first.simplify_m, glacier_buffer_m=first.glacier_buffer_m
+)
+tiles = gpd.GeoSeries(
+    [shapely.box(*g.geographic_extent.boundingbox) for g in MGRSGrid(aoi, first.pixel_size_m)],
+    crs="EPSG:4326",
+)
+print(f"{len(tiles)} tiles")
+```
+
+## Catalog search
+
+One search per year and polarization over the bounding box of all tiles, with the
+run's window and mode: a superset of every tile's search, from which the tiles select
+below. The catalog pages no further than 11 000 results, which a 90-day window of the
+two-satellite years exceeds, so the window is searched in chunks of `CHUNK_DAYS`, and a
+chunk the catalog still refuses as too large is halved.
+
+```{python}
+CHUNK_DAYS = 15
+ATTEMPTS = 4  # the catalog times out now and then under concurrent searches
+
+
+def search_chunk(catalog: BurstCatalog, window: TimeRange, **filters: Any) -> gpd.GeoDataFrame:
+    """Search one window of the catalog, retrying on request errors.
+
+    A window past the catalog's page limit is split in two and searched again.
+    """
+    query = SearchQuery(time_range=window, **filters)
+    try:
+        for attempt in range(1, ATTEMPTS):
+            try:
+                return catalog.search(query).df
+            except requests.RequestException:
+                time.sleep(30 * attempt)
+        return catalog.search(query).df
+    except TooManyResultsError:
+        if window.start == window.end:
+            raise
+        middle = window.start + (window.end - window.start) // 2
+        return pd.concat(
+            [
+                search_chunk(catalog, TimeRange(window.start, middle), **filters),
+                search_chunk(catalog, TimeRange(middle + timedelta(1), window.end), **filters),
+            ],
+            ignore_index=True,
+        )
+
+
+def search_bursts(config: CompositeConfig, pol: str) -> BurstCollection:
+    """Return the bursts of a year and polarization over all tiles, cached as Parquet."""
+    path = CACHE_DIR / f"bursts_{config.year}_{pol}.parquet"
+    if not path.exists():
+        catalog = BurstCatalog(file_manager=config.to_file_manager(), show_progress=False)
+        window = config.time_range
+        starts = pd.date_range(window.start, window.end, freq=f"{CHUNK_DAYS}D").date
+        chunks = [
+            search_chunk(
+                catalog,
+                TimeRange(start, min(start + timedelta(CHUNK_DAYS - 1), window.end)),
+                polarization=pol,
+                intersects=shapely.box(*tiles.total_bounds),
+                mode=config.mode,
+            )
+            for start in starts
+        ]
+        pd.concat(chunks, ignore_index=True).to_parquet(path)
+    # The collection drops duplicate entries, as the run's search results do.
+    return BurstCollection(gpd.read_parquet(path))
+
+
+jobs = [(year, pol) for year, c in configs.items() for pol in c.polarizations]
+with ThreadPoolExecutor(max_workers=3) as pool:
+    searched = dict(
+        zip(jobs, pool.map(lambda job: search_bursts(configs[job[0]], job[1]), jobs), strict=True)
+    )
+```
+
+## Per-tile selection
+
+Pairing all selected bursts at once and keeping the pairs whose two bursts share a
+tile gives the same pairs as pairing each tile on its own, at a fraction of the time.
+
+```{python}
+FOOTPRINT = ["rel_orbit_number", "burst_id", "sub_swath"]
+
+
+def select(config: CompositeConfig, bursts: BurstCollection) -> dict:
+    """Replicate a run's per-tile selection for one polarization.
+
+    Returns the selected bursts and pairs, each keyed by footprint and acquisition
+    day so that the polarizations can be merged, and the number of tile-burst hits.
+    """
+    df = bursts.df.reset_index(drop=True)
+    tile_idx, burst_idx = df.sindex.query(tiles, predicate="intersects")
+    hits = pd.DataFrame({"tile": tile_idx, "b": burst_idx})
+    used = df.iloc[np.unique(burst_idx)]
+
+    pairs = find_pairs(BurstCollection(used), config).df.reset_index(drop=True)
+    identity = pd.MultiIndex.from_frame(df[["burst_id", "sub_swath", "date"]])
+    for i in (1, 2):
+        pairs[f"b{i}"] = identity.get_indexer(
+            pd.MultiIndex.from_arrays([pairs["burst_id"], pairs["sub_swath"], pairs[f"date_{i}"]])
+        )
+    shared = (
+        pairs[["b1", "b2"]]
+        .reset_index(names="p")
+        .merge(hits.rename(columns={"b": "b1"}), on="b1")
+        .merge(hits.rename(columns={"b": "b2"}), on=["b2", "tile"])
+    )
+    pairs = pairs[pairs.index.isin(shared["p"])]
+
+    return {
+        "bursts": set(zip(*(used[c] for c in FOOTPRINT), used["date"].dt.date, strict=True)),
+        "pairs": set(
+            zip(
+                *(pairs[c] for c in FOOTPRINT),
+                pairs["date_1"].dt.date,
+                pairs["date_2"].dt.date,
+                strict=True,
+            )
+        ),
+        "tile_bursts": len(hits),
+        # S1A, S1B, ... from the name of the product each burst was cut from.
+        "satellites": set(used["parent_product_name"].str[2]),
+    }
+
+
+selected = {key: select(configs[key[0]], bursts) for key, bursts in searched.items()}
+```
+
+## Counts
+
+```{python}
+per_pol = pd.DataFrame.from_dict(
+    {
+        key: {
+            "bursts": len(s["bursts"]),
+            "pairs": len(s["pairs"]),
+            "tile_bursts": s["tile_bursts"],
+        }
+        for key, s in selected.items()
+    },
+    orient="index",
+).rename_axis(["year", "polarization"])
+
+counts = pd.DataFrame.from_dict(
+    {
+        year: {
+            "window_start": c.time_range.start,
+            "window_end": c.time_range.end,
+            "bursts": len(
+                set().union(*(selected[year, pol]["bursts"] for pol in c.polarizations))
+            ),
+            "pairs": len(set().union(*(selected[year, pol]["pairs"] for pol in c.polarizations))),
+            "satellites": ", ".join(
+                sorted(
+                    set().union(*(selected[year, pol]["satellites"] for pol in c.polarizations))
+                )
+            ),
+        }
+        for year, c in configs.items()
+    },
+    orient="index",
+).rename_axis("year")
+
+table = counts.join(
+    per_pol.unstack("polarization").pipe(
+        lambda d: d.set_axis([f"{q}_{pol.lower()}" for q, pol in d.columns], axis=1)
+    )
+)
+table.to_csv(REPORT_DIR / f"{TABLE_NAME}.csv")
+print(table.to_string())
+```
+
+## LaTeX
+
+Two variants of the table, one with the satellites that recorded each year's bursts
+(A to D for Sentinel-1A to -1D) and one without. Both end with the total over all
+years, below a rule the Styler does not write.
+
+```{python}
+def day(d: date) -> str:
+    """``Jul  5``: the day right-aligned, so the windows line up in the source."""
+    return f"{d:%b} {d.day:>2}"
+
+
+def thousands_space(n: int) -> str:
+    """``12\\,345``: thin-space digit groups."""
+    return f"{n:,}".replace(",", r"\,")
+
+
+COUNT_COLUMNS = ["Burst acquisitions", "12-day pairs"]
+
+
+def booktabs(*, satellites: bool) -> str:
+    """Booktabs tabular of the windows and counts per year, with a total row."""
+    rows = pd.DataFrame(
+        {
+            "Year": counts.index.astype(str),
+            "Compositing window": [
+                f"{day(s)} -- {day(e)}"
+                for s, e in zip(counts["window_start"], counts["window_end"], strict=True)
+            ],
+            # Beside the counts, which it explains.
+            **({"Satellites": counts["satellites"].to_numpy()} if satellites else {}),
+            "Burst acquisitions": counts["bursts"].to_numpy(),
+            "12-day pairs": counts["pairs"].to_numpy(),
+        }
+    )
+    total = {
+        "Year": "Total",
+        "Burst acquisitions": counts["bursts"].sum(),
+        "12-day pairs": counts["pairs"].sum(),
+    }
+    rows = pd.concat([rows, pd.DataFrame([total])], ignore_index=True).fillna("")
+    latex = (
+        rows.style.hide(axis="index")
+        .format(thousands_space, subset=COUNT_COLUMNS)
+        .to_latex(hrules=True, column_format="l" * (len(rows.columns) - 2) + "rr")
+    )
+    lines = latex.splitlines()
+    lines.insert(lines.index(r"\bottomrule") - 1, r"\midrule")
+    return "\n".join(lines) + "\n"
+```
+
+```{python}
+latex = booktabs(satellites=False)
+(REPORT_DIR / f"{TABLE_NAME}.tex").write_text(latex)
+print(latex)
+```
+
+```{python}
+latex = booktabs(satellites=True)
+(REPORT_DIR / f"{TABLE_NAME}-satellites.tex").write_text(latex)
+print(latex)
+```

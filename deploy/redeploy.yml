@@ -1,0 +1,188 @@
+---
+# Rolls out a new image build to VMs created by fleet.yml, without recreating
+# any VMs: stops each running container, re-syncs .env and the EE service
+# account key, pulls the latest image, and restarts the container with the
+# same script/config/args it was launched with (looked up from the jobs manifest
+# by VM name, so this stays in sync with fleet.yml without any hardcoded
+# command). Pass the same `jobs_file` you deployed the fleet with.
+#
+# Usage:
+#   pixi run -e deploy ansible-playbook deploy/redeploy.yml
+#   pixi run -e deploy ansible-playbook deploy/redeploy.yml -e "jobs_file=jobs-pass.yml"
+
+- name: Discover existing glacier-fleet VMs
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    all_jobs: "{{ (lookup('file', playbook_dir + '/' + (jobs_file | default('jobs-lrw.yml', true))) | from_yaml).jobs }}"
+
+  tasks:
+    - name: Parse local .env into vars
+      ansible.builtin.set_fact:
+        local_env: >-
+          {{ lookup('file', playbook_dir + '/../.env').splitlines()
+            | select('match', '^[A-Z]')
+            | map('split', '=', 1)
+            | list
+            | items2dict(key_name=0, value_name=1) }}
+      no_log: true
+
+    - name: Render .env content for VMs
+      ansible.builtin.set_fact:
+        env_content: "{{ lookup('template', playbook_dir + '/env.j2') }}"
+        ee_key_file: "{{ local_env['EE_SERVICE_ACC_KEY_FILE'] }}"
+      no_log: true
+
+    - name: Render AWS credentials for VMs
+      ansible.builtin.set_fact:
+        aws_credentials_content: "{{ lookup('template', playbook_dir + '/aws-credentials.j2') }}"
+      no_log: true
+
+    - name: List glacier-fleet VMs
+      openstack.cloud.server_info:
+        cloud: "{{ cloud }}"
+        name: "glacier-fleet-*"
+        filters:
+          status: ACTIVE
+      register: vm_info
+
+    - name: Fail if no VMs found
+      ansible.builtin.fail:
+        msg: "No active glacier-fleet-* VMs found on cloud {{ cloud }}."
+      when: vm_info.servers | length == 0
+
+    - name: Register VMs in inventory
+      ansible.builtin.add_host:
+        name: "{{ item.addresses[openstack_network][0].addr }}"
+        groups: glacier_vms
+        job_name: "{{ vm_job_name }}"
+        job_script: "{{ vm_job.script }}"
+        job_config: "{{ vm_job.config }}"
+        job_args: "{{ vm_job.args | default('') }}"
+        ansible_user: ubuntu
+        ansible_python_interpreter: /usr/bin/python3
+        ansible_ssh_common_args: '-o GSSAPIAuthentication=no'
+      vars:
+        vm_job_name: "{{ item.name | regex_replace('^glacier-fleet-', '') }}"
+        vm_job: "{{ all_jobs | selectattr('name', 'equalto', vm_job_name) | first }}"
+      # Every fleet shares the glacier-fleet-* prefix, so the listing also returns
+      # the VMs of the other jobs manifests. Theirs is not this rollout's to
+      # restart, and looking their job up here would only fail on an empty match.
+      when: all_jobs | selectattr('name', 'equalto', vm_job_name) | list | length > 0
+      loop: "{{ vm_info.servers }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+- name: Roll out latest image
+  hosts: glacier_vms
+  gather_facts: false
+  become: true
+  vars:
+    github_token: "{{ lookup('env', 'GITHUB_TOKEN') | default(lookup('pipe', 'gh auth token'), true) }}"
+    github_actor: "{{ lookup('env', 'GITHUB_ACTOR') | default(lookup('pipe', 'gh api user --jq .login'), true) }}"
+
+  tasks:
+    # Tolerates a VM that is inside the port-22 gap of an unattended-upgrade run.
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+
+    # No upgrade or reboot here: a reboot would kill the job these VMs are
+    # running. Only the timers are disarmed and Docker reconciled.
+    - name: Prepare the host (timers only)
+      ansible.builtin.include_tasks: tasks/prepare-host.yml
+      vars:
+        host_upgrade: false
+
+    - name: Stop container
+      community.docker.docker_container:
+        name: "glacier-fleet-{{ job_name }}"
+        state: stopped
+
+    - name: Write .env file
+      ansible.builtin.copy:
+        content: "{{ hostvars['localhost']['env_content'] }}"
+        dest: /home/ubuntu/.env
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+
+    - name: Create secrets directory
+      ansible.builtin.file:
+        path: /home/ubuntu/secrets
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0700'
+
+    - name: Copy EE service account key
+      ansible.builtin.copy:
+        src: "{{ hostvars['localhost']['ee_key_file'] }}"
+        dest: /home/ubuntu/secrets/ee-service-account.json
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+
+    - name: Write AWS credentials file
+      ansible.builtin.copy:
+        content: "{{ hostvars['localhost']['aws_credentials_content'] }}"
+        dest: /home/ubuntu/secrets/aws-credentials
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+      no_log: true
+
+    - name: Log in to ghcr.io
+      community.docker.docker_login:
+        registry: ghcr.io
+        username: "{{ github_actor }}"
+        password: "{{ github_token }}"
+
+    - name: Pull latest Docker image
+      community.docker.docker_image:
+        name: "{{ hostvars['localhost']['image'] }}"
+        source: pull
+        force_source: true
+      register: pull_job
+      async: 600
+      poll: 0
+
+    - name: Wait for Docker image pull
+      ansible.builtin.async_status:
+        jid: "{{ pull_job.ansible_job_id }}"
+      register: pull_result
+      until: pull_result.finished
+      retries: 60
+      delay: 10
+
+    - name: Restart container with latest image
+      community.docker.docker_container:
+        name: "glacier-fleet-{{ job_name }}"
+        image: "{{ hostvars['localhost']['image'] }}"
+        env_file: /home/ubuntu/.env
+        volumes:
+          - /home/ubuntu/logs:/app/logs
+          - /home/ubuntu/secrets/ee-service-account.json:/app/secrets/ee-service-account.json
+          - /home/ubuntu/secrets/aws-credentials:/app/secrets/aws-credentials:ro
+        command: "python {{ job_script }} {{ job_config }} {{ job_args }}"
+        detach: true
+        state: started
+        recreate: true
+
+- name: Print monitoring commands
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+  tasks:
+    - name: Print monitoring commands
+      ansible.builtin.debug:
+        msg:
+          - "VM {{ item.name }} ({{ item.addresses[openstack_network][0].addr }})"
+          - "Logs: ssh ubuntu@{{ item.addresses[openstack_network][0].addr }} 'sudo docker logs -f {{ item.name }}'"
+      when: item.addresses[openstack_network][0].addr in groups['glacier_vms'] | default([])
+      loop: "{{ hostvars['localhost']['vm_info'].servers }}"
+      loop_control:
+        label: "{{ item.name }}"

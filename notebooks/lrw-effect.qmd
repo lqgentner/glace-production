@@ -1,0 +1,296 @@
+---
+title: "Effect of local resolution weighting"
+format:
+  html:
+    embed-resources: true
+jupyter: python3
+---
+
+Single-pass composites against the local resolution-weighted (LRW) GLACE composite in
+steep terrain: the ascending-only and descending-only unweighted mean composites, the
+LRW composite and its composite quality map (QA-CQM), for one 10 km window. A switch
+selects VV backscatter or VV coherence; the CQM is the one written with that layer.
+Pixels a single-pass composite has no valid observation for (radar shadow, in
+backscatter) are drawn in a non-white colour. The CQM is the reciprocal of the
+composite's effective local scattering area, drawn in dB as in Small et al. (2022):
+higher is better resolved. 0 dB is a facet at 45° local incidence; flat terrain is
+about −1 dB, the tangent of the incidence angle.
+
+The LRW composite and its CQM are the GLACE tiles of the Alps-wide run
+(`config/lrw-alps.yml`, `alps-total/{year}/s1-comp`, byte-identical to the
+published ones). The pass composites are not part of GLACE: they come from
+`config/pass-alps.yml`, run over the glaciers of the Alps on the same burst
+products and written to `alps-total/{year}/s1-comp-pass`. Both share the compositing
+window, the 35x7 coherence window and the mean. The tiles under the window are
+mosaicked on reading, so it may span several of them.
+
+```{python}
+import cmcrameri.cm as cmc
+from matplotlib.font_manager import FontProperties
+from matplotlib.patches import Patch
+import matplotlib.pyplot as plt
+from matplotlib_inline.backend_inline import set_matplotlib_formats
+import numpy as np
+from pyproj import CRS, Transformer
+
+from glace_production.config import settings
+from glace_production.plotting import add_scalebar, set_context, set_style
+from data_paths import PASS_CONFIG, run_dirs
+from regions import LRW_REGION, REGION_EPSG, region_bounds
+from tiles import read_window, tile_file, window_tiles
+
+set_style()
+set_context("paper")
+set_matplotlib_formats("retina")
+```
+
+## Configuration
+
+The window is `LRW_REGION` in `regions.py` beside this notebook, selected like the
+mapping examples' by its lower-left corner (UTM 32N, metres, on the 10 m grid), and 10
+km on a side; the dataset overview marks it with them. Gurgler Ferner (Austrian
+Glacier Inventory GI5) flows north into the north-south Gurgler Tal, so the ascending
+(east-looking) and descending (west-looking) passes see each valley side at a fine
+resolution in one pass and foreshortened in the other.
+
+```{python}
+LAYER = "coh"  # "coh" for VV coherence (the paper figure), "rtc" for VV backscatter
+REGION = LRW_REGION
+
+FIGURE_NAME = "lrw-effect"  # saved as {FIGURE_NAME}-{LAYER}.pdf in FIGURE_DIR
+FIGURE_DIR = settings.figures_dir / FIGURE_NAME  # one folder per notebook
+FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+
+# One stretch for the three composites, rounded from their pooled percentiles, which
+# are printed to compare against. The CQM is drawn as 10 log10(CQM), as in Small et al.
+# (2022); 0 dB is a facet at 45° local incidence, flat terrain about -1 dB.
+STRETCH_PERCENTILES = (2, 98)
+LAYERS = {
+    "rtc": {
+        "prefix": "S1_RTC",
+        "label": "VV backscatter (dB)",
+        "cmap": cmc.navia,
+        "vmin": -20,
+        "vmax": 0,
+        "ticks": np.arange(-20, 0 + 1e-6, 5),
+    },
+    "coh": {
+        "prefix": "S1_COH12",
+        "label": "VV coherence",
+        "cmap": cmc.lipari,
+        "vmin": 0.0,
+        "vmax": 0.8,
+        "ticks": np.arange(0.0, 0.8 + 1e-6, 0.2),
+    },
+}
+CQM_CMAP = cmc.oslo
+CQM_VMIN, CQM_VMAX = -6, 6
+CQM_TICKS = np.arange(CQM_VMIN, CQM_VMAX + 1e-6, 3)
+CQM_LABEL = "Composite quality (dB)"
+# Pixels without a valid observation: radar shadow in a single-pass composite. A violet
+# magenta, which stays apart from navia, lipari and oslo under deuteranopia, protanopia
+# and tritanopia as well (a grey or a darker magenta falls onto navia's blues)
+NODATA_COLOR = "#c000ff"
+NODATA_LABEL = "No valid observation"
+
+# Hung from one top line, so a title may break over two lines; the colormaps tell the
+# composites (a-c) from the quality map (d), and the titles pair c with d
+TITLES = ["Ascending", "Descending", "GLACE", "GLACE composite\nquality map"]
+
+# Layout in mm: four square panels in one row fill the width, and the figure height
+# follows from them; Nature's maximum is 180 mm x 215 mm. The composites' colorbar is
+# centred below b and reaches into a and c, so it reads as theirs; the CQM's sits below d.
+MM = 1 / 25.4  # inches per mm
+FIG_WIDTH = 180
+GAP = 2.0  # between the panels
+MARGIN_LEFT = 0.5
+MARGIN_RIGHT = 0.5
+TITLE_TOP = 0.5  # from the figure's top edge to the top of the titles
+MARGIN_TOP = 8.4  # panel titles, up to two lines, and 1.2 mm
+COLORBAR_GAP = 2.0  # between the maps and the colorbars
+# Colorbars and scalebars as in mapping-examples.qmd, relative to the panel width: the
+# extend triangles (5 % of the bar each) stay inside the panel
+COLORBAR_WIDTH = 0.90  # fraction of the panel width, centred below it
+COLORBAR_ASPECT = 20  # colorbar length over thickness, as matplotlib's `aspect`
+COLORBAR_EXTENDFRAC = 0.05  # matplotlib's default, of the one-panel CQM bar
+# The composites' bar, in panel widths; its thickness and triangles are the CQM bar's
+LAYER_COLORBAR_WIDTH = 1.5
+MARGIN_BOTTOM = 11.0  # below the colorbars' top edge: their ticks, label and 0.5 mm
+SCALEBAR_FONTSIZE = 7  # pt, one step below the body text: an annotation on the map
+```
+
+```{python}
+MAP_CRS = CRS.from_epsg(REGION_EPSG)
+layer = LAYERS[LAYER]
+year = REGION["year"]
+bounds = region_bounds(REGION)
+
+LRW_DIR = run_dirs(year).comp_dir
+PASS_DIR = run_dirs(year, PASS_CONFIG).comp_dir
+
+# The tiles in the window's UTM zone that overlap it; one that only touches its edge is
+# left out
+tiles = window_tiles(bounds, REGION_EPSG)
+print(f"tiles: {', '.join(tiles)}")
+
+prefix = layer["prefix"]
+patterns = {
+    "asc": (PASS_DIR, f"{prefix}_COMP_A_{{tile}}_VV_*.tif"),
+    "dsc": (PASS_DIR, f"{prefix}_COMP_D_{{tile}}_VV_*.tif"),
+    "lrw": (LRW_DIR, f"{prefix}_LRW_{{tile}}_VV_*.tif"),
+    "cqm": (LRW_DIR, f"{prefix}_LRW_QA-CQM_{{tile}}_VV_*.tif"),
+}
+data = {
+    key: read_window([tile_file(d, pattern, t) for t in tiles], bounds, REGION_EPSG)
+    for key, (d, pattern) in patterns.items()
+}
+if LAYER == "rtc":  # every composite is linear; drawn in dB
+    for key in ("asc", "dsc", "lrw"):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            data[key] = np.where(data[key] > 0, 10 * np.log10(data[key]), np.nan)
+with np.errstate(divide="ignore", invalid="ignore"):  # the CQM is linear; drawn in dB
+    data["cqm"] = np.where(data["cqm"] > 0, 10 * np.log10(data["cqm"]), np.nan)
+```
+
+The share of the window without a valid observation in each composite, and the
+stretch percentiles:
+
+```{python}
+for key in ("asc", "dsc", "lrw", "cqm"):
+    print(f"{key}: {np.mean(~np.isfinite(data[key])):.1%} without a valid observation")
+both = ~np.isfinite(data["asc"]) & ~np.isfinite(data["dsc"])
+print(f"missing in both passes: {both.mean():.2%}")
+
+pooled = np.concatenate([data[k][np.isfinite(data[k])] for k in ("asc", "dsc", "lrw")])
+lo, hi = np.percentile(pooled, STRETCH_PERCENTILES)
+print(f"{STRETCH_PERCENTILES} % {layer['label']}: {lo:.2f} to {hi:.2f}")
+print(f"stretch: {layer['vmin']} to {layer['vmax']}")
+cqm = data["cqm"][np.isfinite(data["cqm"])]
+print(f"{STRETCH_PERCENTILES} % CQM: {np.percentile(cqm, STRETCH_PERCENTILES).round(1)} dB")
+print(f"CQM < 0 dB: {np.mean(cqm < 0):.1%}, stretch: {CQM_VMIN} to {CQM_VMAX} dB")
+```
+
+Window centre for the caption, in WGS 84:
+
+```{python}
+left, bottom, right, top = bounds
+lon, lat = Transformer.from_crs(MAP_CRS, "EPSG:4326", always_xy=True).transform(
+    (left + right) / 2, (bottom + top) / 2
+)
+print(f"{REGION['name']}, {year}: {lat:.4f}° N, {lon:.4f}° E")
+```
+
+## Figure
+
+```{python}
+def with_bad(cmap):
+    """``cmap`` with NaN drawn in ``NODATA_COLOR``."""
+    cmap = cmap.copy()
+    cmap.set_bad(NODATA_COLOR)
+    return cmap
+
+
+def extend(values: list[np.ndarray], vmin: float, vmax: float) -> str:
+    """Colorbar ``extend`` for the ends of ``[vmin, vmax]`` the finite values exceed."""
+    low = any(np.nanmin(v) < vmin for v in values)
+    high = any(np.nanmax(v) > vmax for v in values)
+    return {(False, False): "neither", (True, False): "min", (False, True): "max"}.get(
+        (low, high), "both"
+    )
+
+
+# Every position in mm from the top-left corner. Titles and colorbar ticks must fit
+# the margins: nothing moves the panels to make room.
+panel_mm = (FIG_WIDTH - MARGIN_LEFT - MARGIN_RIGHT - 3 * GAP) / 4
+column_xs = [MARGIN_LEFT + j * (panel_mm + GAP) for j in range(4)]
+cbar_y = MARGIN_TOP + panel_mm + COLORBAR_GAP
+fig_height = cbar_y + MARGIN_BOTTOM
+print(f"figure {FIG_WIDTH} mm x {fig_height:.1f} mm, panels {panel_mm:.2f} mm")
+
+
+def rect(x: float, y: float, width: float, height: float) -> tuple[float, float, float, float]:
+    """Figure-fraction rectangle of a box at (x, y) mm from the top-left corner."""
+    return (x / FIG_WIDTH, 1 - (y + height) / fig_height, width / FIG_WIDTH, height / fig_height)
+
+
+def draw_title(x: float, letter: str, title: str) -> None:
+    """Bold panel ``letter`` at ``x`` mm and bold ``title`` centred on the panel there,
+    both hung from TITLE_TOP."""
+    kwargs = {
+        "fontsize": plt.rcParams["axes.titlesize"],
+        "fontweight": "bold",
+        "va": "top",
+    }
+    y = 1 - TITLE_TOP / fig_height
+    fig.text(x / FIG_WIDTH, y, letter, ha="left", **kwargs)
+    fig.text(
+        (x + panel_mm / 2) / FIG_WIDTH, y, title, ha="center", multialignment="center", **kwargs
+    )
+
+
+fig = plt.figure(figsize=(FIG_WIDTH * MM, fig_height * MM))
+axs = [fig.add_axes(rect(x, MARGIN_TOP, panel_mm, panel_mm)) for x in column_xs]
+kwargs = {"extent": (left, right, bottom, top), "origin": "upper", "interpolation": "nearest"}
+cmap = with_bad(layer["cmap"])
+for ax, key in zip(axs[:3], ("asc", "dsc", "lrw"), strict=True):
+    im = ax.imshow(data[key], cmap=cmap, vmin=layer["vmin"], vmax=layer["vmax"], **kwargs)
+cqm_im = axs[3].imshow(
+    data["cqm"], cmap=with_bad(CQM_CMAP), vmin=CQM_VMIN, vmax=CQM_VMAX, **kwargs
+)
+for ax, x, letter, title in zip(axs, column_xs, "abcd", TITLES, strict=True):
+    ax.set(xticks=[], yticks=[])
+    ax.spines[:].set_visible(False)
+    draw_title(x, letter, title)
+
+add_scalebar(
+    axs[3],
+    style="filled",
+    loc="lower right",
+    crs=MAP_CRS,
+    linewidth=plt.rcParams["axes.linewidth"],
+    prop=FontProperties(size=SCALEBAR_FONTSIZE),
+)
+
+# The composites' colorbar centred under b, reaching into a and c, the CQM's under d.
+# Both share the CQM bar's thickness and the length of its extend triangles, so the
+# longer bar takes a proportionally smaller extendfrac.
+cbar_width = COLORBAR_WIDTH * panel_mm
+cbar_height = cbar_width / COLORBAR_ASPECT
+layer_width = LAYER_COLORBAR_WIDTH * panel_mm
+layer_cax = fig.add_axes(
+    rect(column_xs[1] + (panel_mm - layer_width) / 2, cbar_y, layer_width, cbar_height)
+)
+cqm_cax = fig.add_axes(
+    rect(column_xs[3] + (panel_mm - cbar_width) / 2, cbar_y, cbar_width, cbar_height)
+)
+fig.colorbar(
+    im,
+    cax=layer_cax,
+    orientation="horizontal",
+    extend=extend([data[k] for k in ("asc", "dsc", "lrw")], layer["vmin"], layer["vmax"]),
+    extendfrac=COLORBAR_EXTENDFRAC * cbar_width / layer_width,
+    label=layer["label"],
+    ticks=layer["ticks"],
+)
+fig.colorbar(
+    cqm_im,
+    cax=cqm_cax,
+    orientation="horizontal",
+    extend=extend([data["cqm"]], CQM_VMIN, CQM_VMAX),
+    extendfrac=COLORBAR_EXTENDFRAC,
+    label=CQM_LABEL,
+    ticks=CQM_TICKS,
+)
+# The no-data patch below panel a, where a composite has pixels without an observation
+if any(np.isnan(data[k]).any() for k in ("asc", "dsc", "lrw", "cqm")):
+    fig.legend(
+        handles=[Patch(facecolor=NODATA_COLOR, edgecolor="none", label=NODATA_LABEL)],
+        loc="upper left",
+        bbox_to_anchor=(column_xs[0] / FIG_WIDTH, 1 - cbar_y / fig_height),
+        borderaxespad=0,
+        borderpad=0,
+        handletextpad=0.5,
+    )
+with (FIGURE_DIR / f"{FIGURE_NAME}-{LAYER}.pdf").open("wb") as f:
+    fig.savefig(f, format="pdf", bbox_inches=None)
+```

@@ -1,0 +1,56 @@
+# Fleet job manifest for the Alps-wide LRW composites.
+#
+# Each entry is one VM/container: `name` must be unique (used for the VM name
+# glacier-fleet-<name> and the container name); `script`, `config`, and the
+# optional `args` are passed straight to `python <script> <config> <args>` on the
+# VM. `args` holds OmegaConf dot-notation overrides, which is how the annual runs
+# all share a single config file.
+jobs:
+  - name: alps-2015
+    script: scripts/s1-composites/process-composites.py
+    config: config/lrw-alps.yml
+    args: year=2015
+  - name: alps-2016
+    script: scripts/s1-composites/process-composites.py
+    config: config/lrw-alps.yml
+    args: year=2016
+  - name: alps-2017
+    script: scripts/s1-composites/process-composites.py
+    config: config/lrw-alps.yml
+    args: year=2017
+  - name: alps-2018
+    script: scripts/s1-composites/process-composites.py
+    config: config/lrw-alps.yml
+    args: year=2018
+  - name: alps-2019
+    script: scripts/s1-composites/process-composites.py
+    config: config/lrw-alps.yml
+    args: year=2019
+  - name: alps-2020
+    script: scripts/s1-composites/process-composites.py
+    config: config/lrw-alps.yml
+    args: year=2020
+  - name: alps-2021
+    script: scripts/s1-composites/process-composites.py
+    config: config/lrw-alps.yml
+    args: year=2021
+  - name: alps-2022
+    script: scripts/s1-composites/process-composites.py
+    config: config/lrw-alps.yml
+    args: year=2022
+  - name: alps-2023
+    script: scripts/s1-composites/process-composites.py
+    config: config/lrw-alps.yml
+    args: year=2023
+  - name: alps-2024
+    script: scripts/s1-composites/process-composites.py
+    config: config/lrw-alps.yml
+    args: year=2024
+  - name: alps-2025
+    script: scripts/s1-composites/process-composites.py
+    config: config/lrw-alps.yml
+    args: year=2025
+  - name: alps-2026
+    script: scripts/s1-composites/process-composites.py
+    config: config/lrw-alps.yml
+    args: year=2026
