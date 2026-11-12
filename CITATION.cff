@@ -1,6 +1,7 @@
 # Citation metadata for this repository, read by GitHub ("Cite this repository")
-# and by Zenodo when it archives a release. Add the Zenodo DOI once the first
-# release has one. The dataset this code produced is listed under `references`.
+# and by Zenodo when it archives a release. `doi` names this version, the
+# identifier below every version. The dataset this code produced is listed
+# under `references`.
 cff-version: 1.2.0
 message: If you use this code, please cite it as below. If you use the dataset, cite GLACE Alps.
 type: software
@@ -20,7 +21,13 @@ authors:
     affiliation: University of Zurich, Department of Geography
 license: MIT
 repository-code: https://github.com/lqgentner/glace-production
+doi: 10.5281/zenodo.24159443
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.24159442
+    description: Canonical DOI, every version
 version: "1.0"
+date-released: "2026-11-12"
 keywords:
   - Sentinel-1
   - SAR

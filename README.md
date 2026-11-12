@@ -135,13 +135,15 @@ cross-validation, its metrics and the prediction maps. The spatial folds are com
 
 ## Citing
 
-If you use this code, cite it as:
+If you use this code, cite version 1.0 as:
 
 > Gentner, L. Q. (2026). *GLACE production pipeline* (Version 1.0) [Computer software].
-> https://github.com/lqgentner/glace-production
+> Zenodo. https://doi.org/10.5281/zenodo.24159443
 
-Its Zenodo DOI follows with the first release. If you use the dataset, cite
-version 1.0 of GLACE Alps as:
+To refer to the code across versions, use its canonical DOI,
+https://doi.org/10.5281/zenodo.24159442.
+
+If you use the dataset, cite version 1.0 of GLACE Alps as:
 
 > Gentner, L. Q., Piermattei, L., & Wulf, H. (2026). *GLACE Alps* (Version 1.0)
 > [Data set]. LaRS – Language Repository of Switzerland.
