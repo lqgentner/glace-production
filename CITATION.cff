@@ -11,7 +11,7 @@ abstract: >-
   Alps, 2015–2026. It downloads, processes and composites the Sentinel-1
   bursts, writes the inputs of the GLACE catalog, validates the composites
   against the Swiss Glacier Inventory 2023, and generates the numbers, tables
-  and figures of the GLACE paper.
+  and figures of the accompanying paper.
 authors:
   - family-names: Gentner
     given-names: Luis Q.

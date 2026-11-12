@@ -2,7 +2,7 @@
 
 The code that produced GLACE Alps (Sentinel-1 coherence and backscatter composites of the
 European Alps, 2015–2026, on Source Cooperative as `giuz/glace-alps`), the inputs of its
-catalog (`glace-catalog`) and the results of the GLACE paper. It is a snapshot of the
+catalog (`glace-catalog`) and the results of the accompanying paper. It is a snapshot of the
 pipeline as it ran, not a development repository: keep changes to what reproduces those
 results. `README.md` describes the stages and their pixi tasks.
 
